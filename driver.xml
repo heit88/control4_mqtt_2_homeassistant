@@ -1,0 +1,708 @@
+<devicedata>
+  <copyright>Copyright 2025 Heit Automation</copyright>
+  <creator>John Heit</creator>
+  <manufacturer>Heit Automation</manufacturer>
+  <name>Control4 to Home Assistant Bridge</name>
+  <model>MQTT Bridge v4.5</model>
+  <created>01/18/2025 12:00 PM</created>
+  <modified>11/04/2026 12:00 PM</modified>
+  <version>4.5</version>
+  <small>devices_sm/c4.gif</small>
+  <large>devices_lg/c4.gif</large>
+  <control>lua_gen</control>
+  <controlmethod>ip</controlmethod>
+  <driver>DriverWorks</driver>
+  <combo>true</combo>
+  <proxies qty="1">
+    <proxy proxybindingid="5001">c4_ha_bridge</proxy>
+  </proxies>
+  <connections>
+    <connection>
+      <id>300</id>
+      <facing>6</facing>
+      <connectionname>Contact Sensor Input 1</connectionname>
+      <type>1</type>
+      <consumer>True</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <classname>CONTACT_SENSOR</classname>
+        </class>
+      </classes>
+    </connection>
+
+    <connection>
+      <id>301</id>
+      <facing>6</facing>
+      <connectionname>Contact Sensor Input 2</connectionname>
+      <type>1</type>
+      <consumer>True</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <classname>CONTACT_SENSOR</classname>
+        </class>
+      </classes>
+    </connection>
+
+    <connection>
+      <id>302</id>
+      <facing>6</facing>
+      <connectionname>Contact Sensor Input 3</connectionname>
+      <type>1</type>
+      <consumer>True</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <classname>CONTACT_SENSOR</classname>
+        </class>
+      </classes>
+    </connection>
+    <connection>
+      <id>303</id>
+      <facing>6</facing>
+      <connectionname>Contact Sensor Input 4</connectionname>
+      <type>1</type>
+      <consumer>True</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <classname>CONTACT_SENSOR</classname>
+        </class>
+      </classes>
+    </connection>
+    <connection>
+      <id>304</id>
+      <facing>6</facing>
+      <connectionname>Contact Sensor Input 5</connectionname>
+      <type>1</type>
+      <consumer>True</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <classname>CONTACT_SENSOR</classname>
+        </class>
+      </classes>
+    </connection>
+    <connection>
+      <id>305</id>
+      <facing>6</facing>
+      <connectionname>Contact Sensor Input 6</connectionname>
+      <type>1</type>
+      <consumer>True</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <classname>CONTACT_SENSOR</classname>
+        </class>
+      </classes>
+    </connection>
+    <connection>
+      <id>306</id>
+      <facing>6</facing>
+      <connectionname>Contact Sensor Input 7</connectionname>
+      <type>1</type>
+      <consumer>True</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <classname>CONTACT_SENSOR</classname>
+        </class>
+      </classes>
+    </connection>
+    <connection>
+      <id>307</id>
+      <facing>6</facing>
+      <connectionname>Contact Sensor Input 8</connectionname>
+      <type>1</type>
+      <consumer>True</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <classname>CONTACT_SENSOR</classname>
+        </class>
+      </classes>
+    </connection>
+    <connection>
+      <id>308</id>
+      <facing>6</facing>
+      <connectionname>Contact Sensor Input 9</connectionname>
+      <type>1</type>
+      <consumer>True</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <classname>CONTACT_SENSOR</classname>
+        </class>
+      </classes>
+    </connection>
+    <connection>
+      <id>309</id>
+      <facing>6</facing>
+      <connectionname>Contact Sensor Input 10</connectionname>
+      <type>1</type>
+      <consumer>True</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <classname>CONTACT_SENSOR</classname>
+        </class>
+      </classes>
+    </connection>
+    <connection>
+      <id>310</id>
+      <facing>6</facing>
+      <connectionname>Contact Sensor Input 11</connectionname>
+      <type>1</type>
+      <consumer>True</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <classname>CONTACT_SENSOR</classname>
+        </class>
+      </classes>
+    </connection>
+    <connection>
+      <id>311</id>
+      <facing>6</facing>
+      <connectionname>Contact Sensor Input 12</connectionname>
+      <type>1</type>
+      <consumer>True</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <classname>CONTACT_SENSOR</classname>
+        </class>
+      </classes>
+    </connection>
+    <connection>
+      <id>312</id>
+      <facing>6</facing>
+      <connectionname>Contact Sensor Input 13</connectionname>
+      <type>1</type>
+      <consumer>True</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <classname>CONTACT_SENSOR</classname>
+        </class>
+      </classes>
+    </connection>
+    <connection>
+      <id>313</id>
+      <facing>6</facing>
+      <connectionname>Contact Sensor Input 14</connectionname>
+      <type>1</type>
+      <consumer>True</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <classname>CONTACT_SENSOR</classname>
+        </class>
+      </classes>
+    </connection>
+    <connection>
+      <id>314</id>
+      <facing>6</facing>
+      <connectionname>Contact Sensor Input 15</connectionname>
+      <type>1</type>
+      <consumer>True</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <classname>CONTACT_SENSOR</classname>
+        </class>
+      </classes>
+    </connection>
+    <connection>
+      <id>315</id>
+      <facing>6</facing>
+      <connectionname>Contact Sensor Input 16</connectionname>
+      <type>1</type>
+      <consumer>True</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <classname>CONTACT_SENSOR</classname>
+        </class>
+      </classes>
+    </connection>
+    <connection>
+      <id>316</id>
+      <facing>6</facing>
+      <connectionname>Contact Sensor Input 17</connectionname>
+      <type>1</type>
+      <consumer>True</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <classname>CONTACT_SENSOR</classname>
+        </class>
+      </classes>
+    </connection>
+    <connection>
+      <id>317</id>
+      <facing>6</facing>
+      <connectionname>Contact Sensor Input 18</connectionname>
+      <type>1</type>
+      <consumer>True</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <classname>CONTACT_SENSOR</classname>
+        </class>
+      </classes>
+    </connection>
+    <connection>
+      <id>318</id>
+      <facing>6</facing>
+      <connectionname>Contact Sensor Input 19</connectionname>
+      <type>1</type>
+      <consumer>True</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <classname>CONTACT_SENSOR</classname>
+        </class>
+      </classes>
+    </connection>
+    <connection>
+      <id>319</id>
+      <facing>6</facing>
+      <connectionname>Contact Sensor Input 20</connectionname>
+      <type>1</type>
+      <consumer>True</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <classname>CONTACT_SENSOR</classname>
+        </class>
+      </classes>
+    </connection>
+  </connections>
+  <config>
+    <power_management_method>AlwaysOn</power_management_method>
+    
+    <properties>
+      <property>
+        <name>MQTT Broker IP</name>
+        <type>STRING</type>
+        <default>192.168.1.xxx</default>
+        <readonly>false</readonly>
+      </property>
+      
+      <property>
+        <name>MQTT Broker Port</name>
+        <type>RANGED_INTEGER</type>
+        <default>1883</default>
+        <minimum>1</minimum>
+        <maximum>65535</maximum>
+        <readonly>false</readonly>
+      </property>
+      
+      <property>
+        <name>MQTT Username</name>
+        <type>STRING</type>
+        <default></default>
+        <readonly>false</readonly>
+      </property>
+      
+      <property>
+        <name>MQTT Password</name>
+        <type>STRING</type>
+        <default></default>
+        <readonly>false</readonly>
+      </property>
+      
+      <property>
+        <name>Connection Status</name>
+        <type>STRING</type>
+        <default>Disconnected</default>
+        <readonly>true</readonly>
+      </property>
+      
+      <property>
+        <name>Switch Device IDs (comma separated)</name>
+        <type>STRING</type>
+        <default></default>
+        <readonly>false</readonly>
+        <description>Comma-separated list of Control4 switch device IDs to expose as Home Assistant switches</description>
+      </property>
+
+      <property>
+        <name>Media Room IDs (comma separated)</name>
+        <type>STRING</type>
+        <default></default>
+        <readonly>false</readonly>
+      </property>
+
+      <property>
+        <name>Enable LED Color Control</name>
+        <type>LIST</type>
+        <items>
+          <item>Disabled</item>
+          <item>Enabled</item>
+        </items>
+        <default>Disabled</default>
+        <readonly>false</readonly>
+      </property>
+
+      <property>
+        <name>Enable Advanced Dimmer Controls</name>
+        <type>LIST</type>
+        <items>
+          <item>Disabled</item>
+          <item>Enabled</item>
+        </items>
+        <default>Enabled</default>
+        <readonly>false</readonly>
+      </property>
+
+      <property>
+        <name>Monitored Lights</name>
+        <type>STRING</type>
+        <default>0</default>
+        <readonly>true</readonly>
+      </property>
+
+      <property>
+        <name>Monitored Switches</name>
+        <type>STRING</type>
+        <default>0</default>
+        <readonly>true</readonly>
+      </property>
+
+      <property>
+        <name>Monitored Outlets</name>
+        <type>STRING</type>
+        <default>0</default>
+        <readonly>true</readonly>
+      </property>
+
+      <property>
+        <name>Monitored Thermostats</name>
+        <type>STRING</type>
+        <default>0</default>
+        <readonly>true</readonly>
+      </property>
+
+      <property>
+        <name>Monitored Media Rooms</name>
+        <type>STRING</type>
+        <default>0</default>
+        <readonly>true</readonly>
+      </property>
+
+      <property>
+        <name>Contact Sensor Binding Map</name>
+        <type>STRING</type>
+        <default></default>
+        <readonly>false</readonly>
+        <description>Map bindings to devices and names. Format: deviceID:binding:name (comma-separated). Example: 720:302:Garage Door,720:303:Front Door. Bindings must also be created in Control4 Composer.</description>
+      </property>
+
+      <property>
+        <name>Monitored Contact Sensors</name>
+        <type>STRING</type>
+        <default>0</default>
+        <readonly>true</readonly>
+      </property>
+
+      <property>
+        <name>Last Event</name>
+        <type>STRING</type>
+        <default>None</default>
+        <readonly>true</readonly>
+      </property>
+      
+      <property>
+        <name>Last Command</name>
+        <type>STRING</type>
+        <default>None</default>
+        <readonly>true</readonly>
+      </property>
+
+      <property>
+        <name>Last Error</name>
+        <type>STRING</type>
+        <default>None</default>
+        <readonly>true</readonly>
+      </property>
+
+      <property>
+        <name>Messages Sent</name>
+        <type>STRING</type>
+        <default>0</default>
+        <readonly>true</readonly>
+      </property>
+
+      <property>
+        <name>Messages Received</name>
+        <type>STRING</type>
+        <default>0</default>
+        <readonly>true</readonly>
+      </property>
+
+      <property>
+        <name>Debug Mode</name>
+        <type>LIST</type>
+        <default>Off</default>
+        <readonly>false</readonly>
+        <items>
+          <item>Off</item>
+          <item>Print</item>
+          <item>Log</item>
+          <item>Print and Log</item>
+        </items>
+      </property>
+      <property>
+        <name>Auto Reconnect</name>
+        <type>LIST</type>
+        <default>Enabled</default>
+        <readonly>false</readonly>
+        <items>
+          <item>Enabled</item>
+        <item>Disabled</item>
+        </items>
+      </property>
+    </properties>
+    
+    <actions>
+      <action>
+        <name>Connect to MQTT Broker</name>
+        <command>Connect</command>
+      </action>
+      
+      <action>
+        <name>Disconnect from MQTT Broker</name>
+        <command>Disconnect</command>
+      </action>
+      
+      <action>
+        <name>Publish Auto-Discovery</name>
+        <command>PublishDiscovery</command>
+      </action>
+
+      <action>
+        <name>Remove All Entities</name>
+        <command>RemoveAllEntities</command>
+      </action>
+
+      <action>
+        <name>Publish Test Message</name>
+        <command>PublishTest</command>
+      </action>
+
+      <action>
+        <name>Cleanup Deleted Devices</name>
+        <command>CleanupDeleted</command>
+      </action>
+
+      <action>
+        <name>Show Connection Info</name>
+        <command>ShowInfo</command>
+      </action>
+
+      <action>
+        <name>Auto-Discover All Devices</name>
+        <command>DiscoverAll</command>
+      </action>
+
+      <action>
+        <name>List All Monitored Devices</name>
+        <command>ListAll</command>
+      </action>
+
+      <action>
+        <name>Refresh All Device States</name>
+        <command>RefreshAll</command>
+      </action>
+    </actions>
+    
+    <commands>
+      <command>
+        <name>Add Light to Monitor</name>
+        <description>Monitor light with ID: PARAM1</description>
+        <params>
+          <param>
+            <name>Light Device ID</name>
+            <type>STRING</type>
+          </param>
+        </params>
+      </command>
+      
+      <command>
+        <name>Remove Light from Monitor</name>
+        <description>Stop monitoring light: PARAM1</description>
+        <params>
+          <param>
+            <name>Light Device ID</name>
+            <type>STRING</type>
+          </param>
+        </params>
+      </command>
+      
+      <command>
+        <name>Clear All Monitored Lights</name>
+        <description>Remove all lights from monitoring</description>
+      </command>
+
+      <command>
+        <name>Inspect Device</name>
+        <description>Show all variables for device: PARAM1</description>
+        <params>
+          <param>
+            <name>Device ID</name>
+            <type>STRING</type>
+          </param>
+        </params>
+      </command>
+
+      <command>
+        <name>Send MQTT Command</name>
+        <description>Publish to MQTT topic - Topic: PARAM1, Payload: PARAM2 (optional, defaults to "on")</description>
+        <params>
+          <param>
+            <name>Topic</name>
+            <type>STRING</type>
+          </param>
+          <param>
+            <name>Payload</name>
+            <type>STRING</type>
+          </param>
+        </params>
+      </command>
+
+      <command>
+        <name>Add Thermostat to Monitor</name>
+        <description>Monitor thermostat with ID: PARAM1</description>
+        <params>
+          <param>
+            <name>Thermostat Device ID</name>
+            <type>STRING</type>
+          </param>
+        </params>
+      </command>
+
+      <command>
+        <name>Remove Thermostat from Monitor</name>
+        <description>Stop monitoring thermostat: PARAM1</description>
+        <params>
+          <param>
+            <name>Thermostat Device ID</name>
+            <type>STRING</type>
+          </param>
+        </params>
+      </command>
+
+      <command>
+        <name>Add Switch to Monitor</name>
+        <description>Add switch with Control4 Device ID: PARAM1</description>
+        <params>
+          <param>
+            <name>Control4 Device ID</name>
+            <type>STRING</type>
+          </param>
+        </params>
+      </command>
+
+      <command>
+        <name>Remove Switch from Monitor</name>
+        <description>Remove switch with Device ID: PARAM1</description>
+        <params>
+          <param>
+            <name>Control4 Device ID</name>
+            <type>STRING</type>
+          </param>
+        </params>
+      </command>
+
+      <command>
+        <name>Add Outlet to Monitor</name>
+        <description>Add outlet with Device ID: PARAM1</description>
+        <params>
+          <param>
+            <name>Outlet Device ID</name>
+            <type>STRING</type>
+          </param>
+        </params>
+      </command>
+
+      <command>
+        <name>Remove Outlet from Monitor</name>
+        <description>Remove outlet with Device ID: PARAM1</description>
+        <params>
+          <param>
+            <name>Outlet Device ID</name>
+            <type>STRING</type>
+          </param>
+        </params>
+      </command>
+
+      <command>
+        <name>Add Media Room to Monitor</name>
+        <description>Monitor media room with ID: PARAM1</description>
+        <params>
+          <param>
+            <name>Room ID</name>
+            <type>STRING</type>
+          </param>
+        </params>
+      </command>
+
+      <command>
+        <name>Remove Media Room from Monitor</name>
+        <description>Stop monitoring media room: PARAM1</description>
+        <params>
+          <param>
+            <name>Room ID</name>
+            <type>STRING</type>
+          </param>
+        </params>
+      </command>
+
+    </commands>
+
+    <script jit="1" file="driver.lua" encryption="0"/>
+  </config>
+</devicedata>
