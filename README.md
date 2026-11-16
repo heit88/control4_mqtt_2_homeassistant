@@ -7,7 +7,8 @@ Updates are event-driven, with no polling. The driver holds an open MQTT connect
 ## Supported devices
 
 - Lights and dimmers, including Light V2 color lights
-- Switches and outlets
+- Switches
+- Wireless outlet switches (see [Outlets](#outlets))
 - Thermostats
 - Contact sensors
 - Media rooms (**experimental**, see [the component README](homeassistant_custom_component/README.md))
@@ -21,6 +22,24 @@ Updates are event-driven, with no polling. The driver holds an open MQTT connect
 5. Run these actions in order: **Connect to MQTT Broker**, **Auto-Discover All Devices**, **Publish Auto-Discovery**.
 
 Home Assistant needs its MQTT integration connected to the same broker.
+
+## Outlets
+
+Outlets appear in Home Assistant as switches. **Auto-Discover All Devices** finds them by driver, across three generations of outlet driver:
+
+| Outlet driver | Driver file it is found by |
+|---|---|
+| Original Wireless Outlet Switch | `outlet_light.c4i` |
+| Stock Wireless Outlet Switch V2 (non-dimmable light) | `outlet_nondimmable_light.c4i` |
+| Community Lua outlet driver for the LOZ-5S1 | `outlet_switch_loz5s1_lua.c4z` |
+
+- Each outlet is its own entity, so a two-outlet device gives two switches.
+- Outlets are kept out of the lights list. A stock V2 outlet that an earlier version published as a light becomes a switch on the next discovery, and its old light entity is removed.
+- Dimmable outlet lights (`outlet_dimmable_light.c4i`) stay in the lights list.
+- The Lua outlet driver is recognized by its file name, so a renamed copy of it is not found.
+- From version 4.6 an outlet's entity ID is based on the outlet's own ID, so outlets discovered by an earlier version get new entity IDs.
+
+**Cleanup Deleted Devices** removes deleted lights, switches and outlets from the monitored lists and from Home Assistant.
 
 ## Known limitations
 
@@ -40,6 +59,7 @@ The tests run `driver.lua` against a mock of the Control4 API:
 ```
 pip install lupa
 python tests/light_v2_test.py
+python tests/outlet_test.py
 python tests/bridge_test.py
 ```
 
