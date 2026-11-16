@@ -2,7 +2,7 @@
 -- Author: John Heit
 -- Copyright 2025 Heit Automation
 -- Licensed under the MIT License, see the LICENSE file
--- Version 4.5 - Native C4 Network Stack (Event-Driven), Light V2 color lights
+-- Version 4.6 - Native C4 Network Stack (Event-Driven), Light V2 color lights, all outlet driver generations
 
 -- Constants
 local MQTT_BINDING_ID = 6001  -- Network binding ID for MQTT broker connection
@@ -184,7 +184,8 @@ local DEVICE_TYPES = {
         plural = "Outlets",
         storage_key = "MonitoredOutlets",
         property_name = "Monitored Outlets",
-        proxy_names = {"outlet_light.c4i"},
+        -- Outlets are found by driver file, not by proxy: see OUTLET_DRIVER_FILES / FindOutletProxies
+        proxy_names = {},
         variable_ids = {VARIABLE_IDS.SWITCH_STATE}  -- Outlets are simple on/off switches
     },
     CONTACT_SENSOR = {
@@ -201,6 +202,17 @@ local DEVICE_TYPES = {
             VARIABLE_IDS.CONTACT_REMOTE_TEMP
         }
     }
+}
+
+-- Driver files whose loads are outlets, across the outlet driver generations:
+--   outlet_light.c4i                 light of the original Wireless Outlet Switch (its own proxy)
+--   outlet_nondimmable_light.c4i     light of the stock Wireless Outlet Switch V2 (a Light V2 proxy)
+--   outlet_switch_loz5s1_lua.c4z     community Lua driver: one device with two Light V2 proxies
+-- Dimmable outlet lights (outlet_dimmable_light.c4i) are left to the Lights list.
+local OUTLET_DRIVER_FILES = {
+    "outlet_light.c4i",
+    "outlet_nondimmable_light.c4i",
+    "outlet_switch_loz5s1_lua.c4z"
 }
 
 -- Global Variables
@@ -227,6 +239,7 @@ local gMQTTBuffer = "" -- Buffer for partial MQTT packets
 local gActiveTimers = {} -- One-shot timers that haven't fired yet, for cleanup: [timer] = true
 local gHoldRampRates = {} -- Track hold ramp rates for dimmers: [deviceID] = {up = ms, down = ms}
 local gLightV2Proxies = nil -- Light V2 proxy IDs in the project: [proxyID] = true (built on first use)
+local gOutletProxies = nil -- Outlet proxy IDs in the project: [proxyID] = true (built on first use)
 local gStats = {
     messagesReceived = 0,
     messagesSent = 0,
@@ -294,7 +307,7 @@ end
 function OnDriverInit()
     Log("========================================")
     Log("Control4 to Home Assistant MQTT Bridge")
-    Log("Author: John Heit - Version 4.5")
+    Log("Author: John Heit - Version 4.6")
     Log("Bidirectional Control + Auto-Discovery")
     Log("Contact Sensor Support (Auto-Detection)")
     Log("========================================")
@@ -790,6 +803,10 @@ end
 -- A device can have several proxies, listed comma separated (a Gen3 keypad dimmer has a light
 -- proxy and a keypad proxy): prefer the Light V2 proxy, then the first
 function GetProxyID(deviceID)
+    -- Outlets are stored by their own proxy ID (one device can carry two outlets)
+    if IsOutletProxy(deviceID) then
+        return tonumber(deviceID)
+    end
     local firstProxyID
     for proxyStr in string.gmatch(tostring(C4:GetProxyDevicesById(deviceID) or ""), "%d+") do
         local proxyID = tonumber(proxyStr)
@@ -815,6 +832,97 @@ function IsLightV2(proxyID)
         RefreshLightV2Proxies()
     end
     return gLightV2Proxies[tonumber(proxyID)] == true
+end
+
+-- Find every outlet in the project, whichever outlet driver it uses. Returns the outlets' proxy IDs
+-- in ascending order and rebuilds the lookup set.
+-- Devices are matched by driver file in two ways, because C4:GetDevicesByC4iName does not return
+-- devices of a .c4z driver on every controller: by that call, and by the driverFileName that
+-- C4:GetDevices reports for each device. Of a matching device take its Light V2 proxies (not a
+-- keypad proxy); without any, its other proxies, or the ID as it is (the original outlet light).
+function FindOutletProxies()
+    RefreshLightV2Proxies()
+    local found = {}
+    gOutletProxies = {}
+
+    local function add(id)
+        id = tonumber(id)
+        if id and not gOutletProxies[id] then
+            gOutletProxies[id] = true
+            table.insert(found, id)
+        end
+    end
+
+    -- id: a device or proxy of an outlet driver; knownProxies: proxy IDs already known for it
+    local function consider(id, knownProxies)
+        id = tonumber(id)
+        if not id then
+            return
+        end
+        if IsLightV2(id) then
+            add(id)
+            return
+        end
+        local proxies, seen = {}, {}
+        local function addProxy(proxyID)
+            proxyID = tonumber(proxyID)
+            if proxyID and not seen[proxyID] then
+                seen[proxyID] = true
+                table.insert(proxies, proxyID)
+            end
+        end
+        for _, proxyID in ipairs(knownProxies or {}) do
+            addProxy(proxyID)
+        end
+        for proxyStr in string.gmatch(tostring(C4:GetProxyDevicesById(id) or ""), "%d+") do
+            addProxy(proxyStr)
+        end
+        local lightProxies = 0
+        for _, proxyID in ipairs(proxies) do
+            if IsLightV2(proxyID) then
+                add(proxyID)
+                lightProxies = lightProxies + 1
+            end
+        end
+        if lightProxies == 0 then
+            if #proxies > 0 then
+                for _, proxyID in ipairs(proxies) do
+                    add(proxyID)
+                end
+            else
+                add(id)
+            end
+        end
+    end
+
+    local wanted = {}
+    for _, fileName in ipairs(OUTLET_DRIVER_FILES) do
+        wanted[string.lower(fileName)] = true
+        for key in pairs(C4:GetDevicesByC4iName(fileName) or {}) do
+            consider(key)
+        end
+    end
+
+    for deviceID, deviceInfo in pairs(C4:GetDevices() or {}) do
+        local fileName = type(deviceInfo) == "table" and deviceInfo.driverFileName
+        if fileName and wanted[string.lower(tostring(fileName))] then
+            local proxies = {}
+            for proxyID in pairs(deviceInfo.proxies or {}) do
+                table.insert(proxies, proxyID)
+            end
+            consider(deviceID, proxies)
+        end
+    end
+
+    table.sort(found)
+    return found
+end
+
+function IsOutletProxy(proxyID)
+    if not gOutletProxies then
+        FindOutletProxies()
+    end
+    return gOutletProxies[tonumber(proxyID)] == true
 end
 
 -- Color abilities of a Light V2 light, from its proxy's dynamic capabilities:
@@ -1312,6 +1420,14 @@ function DiscoverAllDevices(deviceType)
     if deviceType == "LIGHT" then
         RefreshLightV2Proxies()
     end
+    -- Outlets of every driver generation; lights and switches leave them to the outlet list
+    local outletProxies = {}
+    if deviceType == "LIGHT" or deviceType == "SWITCH" or deviceType == "OUTLET" then
+        outletProxies = FindOutletProxies()
+        if deviceType == "OUTLET" then
+            Log("  Outlet drivers in the project have " .. #outletProxies .. " outlet(s)")
+        end
+    end
 
     -- Build proxy->device map for all device types except media rooms (which don't have separate device/proxy)
     local proxyToDevice = {}
@@ -1320,6 +1436,19 @@ function DiscoverAllDevices(deviceType)
     end
 
     local foundDevices = {}
+
+    -- Outlets are stored by proxy ID, so both outlets of a two-outlet device are found
+    if deviceType == "OUTLET" then
+        for _, proxyID in ipairs(outletProxies) do
+            local name = C4:GetDeviceDisplayName(proxyID)
+            local state = C4:GetDeviceVariable(proxyID, VARIABLE_IDS.SWITCH_STATE)
+            if name and state ~= nil then
+                table.insert(foundDevices, {id = proxyID, name = name})
+            else
+                Log("  Skipping outlet proxy " .. proxyID .. " - no name or no state variable")
+            end
+        end
+    end
 
     -- Search for all proxy types for this device
     for _, proxyName in ipairs(config.proxy_names) do
@@ -1332,6 +1461,16 @@ function DiscoverAllDevices(deviceType)
                     -- Convert proxy ID to device ID (use proxy as-is only for media rooms/contact sensors)
                     local deviceID = proxyToDevice[proxyID] or proxyID
                     local name = C4:GetDeviceDisplayName(proxyID)  -- Display name comes from proxy
+
+                    if name and (deviceType == "LIGHT" or deviceType == "SWITCH") and IsOutletProxy(proxyID) then
+                        Log("  Skipping " .. proxyID .. " (" .. name .. ") - it is an outlet")
+                        -- Its device may have been published as a light before (with LED color and
+                        -- dimmer control entities): take those out of Home Assistant
+                        if deviceType == "LIGHT" and gMQTTConnected then
+                            RemoveLightEntities(deviceID)
+                        end
+                        name = nil
+                    end
 
                     if name then
                     -- Check if already found
@@ -1387,6 +1526,10 @@ function DiscoverAllDevices(deviceType)
 
     if #foundDevices == 0 then
         Log("No " .. string.lower(config.plural) .. " found in system")
+        -- Don't leave deleted outlets or switches behind in the monitored list
+        if deviceType == "OUTLET" or deviceType == "SWITCH" then
+            CleanupDeletedOfType(deviceType)
+        end
         return false
     end
 
@@ -1573,6 +1716,20 @@ function LoadMediaRoomIDsFromProperty()
     end
 end
 
+-- Take every entity a monitored light can have out of Home Assistant: the light itself, its four
+-- button LED color texts and its advanced dimmer control numbers. An empty retained config removes
+-- an entity, and is harmless for one that was never published.
+function RemoveLightEntities(deviceID)
+    PublishMQTT("homeassistant/light/control4_" .. deviceID .. "/config", "", 1, true)
+    for _, suffix in ipairs({"top_on", "top_off", "bottom_on", "bottom_off"}) do
+        PublishMQTT("homeassistant/text/control4_" .. deviceID .. "_" .. suffix .. "/config", "", 1, true)
+    end
+    for _, suffix in ipairs({"min_on_level", "max_on_level", "preset_level", "click_ramp_rate_up",
+                             "click_ramp_rate_down", "hold_ramp_rate_up", "hold_ramp_rate_down"}) do
+        PublishMQTT("homeassistant/number/control4_" .. deviceID .. "_" .. suffix .. "/config", "", 1, true)
+    end
+end
+
 -- Handle devices that have been deleted from Control4
 function RemoveDeletedDevice(lightID)
     Log("========================================")
@@ -1604,11 +1761,8 @@ function RemoveDeletedDevice(lightID)
     if gMQTTConnected then
         Log("  Publishing removal to Home Assistant...")
 
-        -- Use device ID for topic (consistent with discovery)
-        local discoveryTopic = "homeassistant/light/control4_" .. lightID .. "/config"
-
-        -- Empty payload removes the entity
-        PublishMQTT(discoveryTopic, "", 1, true)
+        -- Empty payloads remove the light and its LED / dimmer control entities
+        RemoveLightEntities(lightID)
         Log("  Device removed from Home Assistant")
     else
         Log("  Not connected to MQTT - device will be removed on next connection")
@@ -1799,6 +1953,7 @@ function AddOutletToMonitor(outletID)
         end
     end
 
+    FindOutletProxies()  -- a newly added outlet driver may not be in the lookup yet
     local outletName = C4:GetDeviceDisplayName(outletID)
     if not outletName then
         LogError("Outlet " .. outletID .. " not found in system")
@@ -4663,6 +4818,35 @@ function ClearAllMonitoredLights()
 end
 
 
+-- Remove deleted switches or outlets (no display name any more) from the monitored list and from
+-- Home Assistant. Returns how many were removed.
+function CleanupDeletedOfType(deviceType)
+    local config = DEVICE_TYPES[deviceType]
+    local list = GetMonitoredList(deviceType)
+    local removed = 0
+
+    for i = #list, 1, -1 do
+        local deviceID = list[i]
+        if not C4:GetDeviceDisplayName(deviceID) then
+            Log("  Found deleted " .. string.lower(config.name) .. ": " .. deviceID)
+            UnsubscribeFromDevice(deviceID, deviceType)
+            table.remove(list, i)
+            removed = removed + 1
+            if gMQTTConnected then
+                -- Empty payload removes the entity (switches and outlets are both HA switches)
+                PublishMQTT("homeassistant/switch/control4_" .. deviceID .. "/config", "", 1, true)
+            end
+        end
+    end
+
+    if removed > 0 then
+        SaveMonitoredDevices(deviceType)
+        UpdateDeviceCount(deviceType)
+        Log("  Removed " .. removed .. " deleted " .. string.lower(removed == 1 and config.name or config.plural))
+    end
+    return removed
+end
+
 function CleanupDeletedDevices()
     Log("========================================")
     Log("Scanning for deleted devices...")
@@ -4677,21 +4861,24 @@ function CleanupDeletedDevices()
         end
     end
 
-    if #deletedDevices == 0 then
+    if #deletedDevices > 0 then
+        Log("")
+        Log("Removing " .. #deletedDevices .. " deleted device(s)...")
+
+        for _, lightID in ipairs(deletedDevices) do
+            RemoveDeletedDevice(lightID)
+        end
+    end
+
+    local removedOthers = CleanupDeletedOfType("SWITCH") + CleanupDeletedOfType("OUTLET")
+    local total = #deletedDevices + removedOthers
+
+    Log("")
+    if total == 0 then
         Log("  No deleted devices found")
-        Log("========================================")
-        return
+    else
+        Log("Cleanup complete - removed " .. total .. " device(s)")
     end
-
-    Log("")
-    Log("Removing " .. #deletedDevices .. " deleted device(s)...")
-
-    for _, lightID in ipairs(deletedDevices) do
-        RemoveDeletedDevice(lightID)
-    end
-
-    Log("")
-    Log("Cleanup complete - removed " .. #deletedDevices .. " device(s)")
     Log("========================================")
 end
 
