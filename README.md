@@ -41,6 +41,18 @@ Outlets appear in Home Assistant as switches. **Auto-Discover All Devices** find
 
 **Cleanup Deleted Devices** removes deleted lights, switches and outlets from the monitored lists and from Home Assistant.
 
+## Dimmer settings and LED colors on Light V2 lights
+
+With **Enable Advanced Dimmer Controls** and **Enable LED Color Control**, dimmers get number entities for their settings (preset, min/max on level, click and hold rates) and text entities for their top and bottom button LED colors.
+
+A Light V2 light (Gen3 dimmers, Hue lights, the community Lua dimmers) keeps these in its proxy rather than in variables: only the Default On preset is a variable. From version 4.7 the driver asks the proxy for them instead:
+
+- It shows only the settings and LEDs the light's driver declares in its capabilities (`click_rates`, `hold_rates`, `min_max`, `supports_default_on`, `has_leds` or `has_button_events`), with the click and hold rate ranges the light reports. The proxy itself reports every setting and three buttons for any light, so a Hue light gets just its preset and click rates.
+- Changes from Home Assistant go to the proxy (`SET_PRESET_LEVEL`, `SET_HOLD_RATE_UP`, `SET_BUTTON_COLOR`, ...), and the settings are read back 3 seconds later, so a value the light refused is put back.
+- Settings are read again on connect, when a light is discovered, and whenever its Default On preset changes. A change made in Composer or on a touchscreen to anything else reaches Home Assistant at the next of these, since the proxy announces nothing for it.
+
+V1 lights work as before.
+
 ## Known limitations
 
 - **No TLS:** the driver uses plain MQTT, so credentials and messages are sent unencrypted. Use it only on a trusted network.

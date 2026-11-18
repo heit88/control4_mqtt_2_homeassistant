@@ -23,13 +23,10 @@ local VARIABLE_IDS = {
     MAX_ON_LEVEL = 1005,            -- Maximum on level (%, 0-100)
     MIN_ON_LEVEL = 1006,            -- Minimum on level (%, 0-100)
 
-    -- Light V2 (light_v2.c4i) proxy variables: the level, state and click rates match V1 above,
-    -- but the other settings moved (1004 is Hold Rate Up here, not the preset)
-    V2_HOLD_RATE_UP = 1004,         -- Hold rate up (ms)
-    V2_HOLD_RATE_DOWN = 1005,       -- Hold rate down (ms)
+    -- Light V2 (light_v2.c4i) proxy variables: level and state match V1 above. Of the dimmer
+    -- settings only the Default On preset is a variable (when the driver supports Default On);
+    -- the others are read from the proxy (RefreshLightV2Settings)
     V2_PRESET_LEVEL = 1006,         -- Default On preset brightness (%)
-    V2_MAX_ON_LEVEL = 1007,         -- Max brightness (%)
-    V2_MIN_ON_LEVEL = 1008,         -- Min brightness (%)
     CURRENT_CHROMATICITY = 1200,    -- Current color "x,y,mode" (mode 1 = color temperature, 0 = full color)
     CURRENT_COLOR_MODE = 1201,      -- Current color mode (1 = color temperature, 0 = full color)
     CURRENT_CCT = 1202,             -- Current color temperature (K)
@@ -120,7 +117,8 @@ local TIMER_INTERVALS = {
     SUBSCRIPTION_DELAY = 50,   -- Reduced from 200ms for faster subscription completion
     DISCOVERY_DELAY = 500,
     AUTO_CONNECT_DELAY = 500,  -- Reduced from 3000ms for faster command response
-    RECONNECT_DELAY = 2000
+    RECONNECT_DELAY = 2000,
+    LIGHT_V2_CONFIRM = 3000    -- after a Light V2 setting or LED change, read the light's settings back
 }
 
 local LIMITS = {
@@ -965,25 +963,111 @@ function ParseChromaticity(value)
     return tonumber(x), tonumber(y), tonumber(mode)
 end
 
--- Advanced dimmer controls: the proxy variable holding each on V1 (light.c4i) and Light V2 lights,
--- and the Light V2 proxy command that changes it. The two proxies keep these settings under
--- different variable IDs, and only Light V2 has variables for the hold rates (shown in seconds).
+-- Advanced dimmer controls: the V1 (light.c4i) proxy variable holding each, and for Light V2 lights
+-- the tag in the proxy's GET_PROPERTIES / GET_SETUP answers and the proxy command that changes it.
+-- A Light V2 proxy keeps these settings to itself: of them only the Default On preset (1006) is a
+-- variable, so the rest are read with C4:SendUIRequest (confirmed on a Gen3 dimmer and a gen2 Lua
+-- dimmer, 2026-11-17). Hold rates are shown in seconds. range: the GET_SETUP limits, in ms.
 local DIMMER_CONTROL_VARS = {
-    min_on_level = {v1 = VARIABLE_IDS.MIN_ON_LEVEL, v2 = VARIABLE_IDS.V2_MIN_ON_LEVEL, command = "SET_MIN_ON_LEVEL", param = "LEVEL"},
-    max_on_level = {v1 = VARIABLE_IDS.MAX_ON_LEVEL, v2 = VARIABLE_IDS.V2_MAX_ON_LEVEL, command = "SET_MAX_ON_LEVEL", param = "LEVEL"},
-    preset_level = {v1 = VARIABLE_IDS.PRESET_LEVEL, v2 = VARIABLE_IDS.V2_PRESET_LEVEL, command = "SET_PRESET_LEVEL", param = "LEVEL"},
-    click_ramp_rate_up = {v1 = VARIABLE_IDS.CLICK_RAMP_RATE_UP, v2 = VARIABLE_IDS.CLICK_RAMP_RATE_UP, command = "SET_CLICK_RATE_UP", param = "RATE"},
-    click_ramp_rate_down = {v1 = VARIABLE_IDS.CLICK_RAMP_RATE_DOWN, v2 = VARIABLE_IDS.CLICK_RAMP_RATE_DOWN, command = "SET_CLICK_RATE_DOWN", param = "RATE"},
-    hold_ramp_rate_up = {v2 = VARIABLE_IDS.V2_HOLD_RATE_UP, command = "SET_HOLD_RATE_UP", param = "RATE", seconds = true},
-    hold_ramp_rate_down = {v2 = VARIABLE_IDS.V2_HOLD_RATE_DOWN, command = "SET_HOLD_RATE_DOWN", param = "RATE", seconds = true}
+    min_on_level = {v1 = VARIABLE_IDS.MIN_ON_LEVEL, tag = "MIN_ON_LEVEL", command = "SET_MIN_ON_LEVEL", param = "LEVEL", capability = "min_max"},
+    max_on_level = {v1 = VARIABLE_IDS.MAX_ON_LEVEL, tag = "MAX_ON_LEVEL", command = "SET_MAX_ON_LEVEL", param = "LEVEL", capability = "min_max"},
+    preset_level = {v1 = VARIABLE_IDS.PRESET_LEVEL, v2 = VARIABLE_IDS.V2_PRESET_LEVEL, tag = "PRESET_LEVEL", command = "SET_PRESET_LEVEL", param = "LEVEL", capability = "supports_default_on"},
+    click_ramp_rate_up = {v1 = VARIABLE_IDS.CLICK_RAMP_RATE_UP, tag = "CLICK_RATE_UP", command = "SET_CLICK_RATE_UP", param = "RATE", range = "CLICK_RATE", capability = "click_rates"},
+    click_ramp_rate_down = {v1 = VARIABLE_IDS.CLICK_RAMP_RATE_DOWN, tag = "CLICK_RATE_DOWN", command = "SET_CLICK_RATE_DOWN", param = "RATE", range = "CLICK_RATE", capability = "click_rates"},
+    hold_ramp_rate_up = {tag = "HOLD_RATE_UP", command = "SET_HOLD_RATE_UP", param = "RATE", seconds = true, range = "HOLD_RATE", capability = "hold_rates"},
+    hold_ramp_rate_down = {tag = "HOLD_RATE_DOWN", command = "SET_HOLD_RATE_DOWN", param = "RATE", seconds = true, range = "HOLD_RATE", capability = "hold_rates"}
 }
+
+-- Light V2 settings and button LED colors as the proxy last answered, by proxy ID:
+-- { values = {suffix = "text"}, leds = {[buttonID] = {on = "rrggbb", off = "rrggbb"}}, setup = "<setup>..." }
+gLightV2Settings = {}
+
+local function xmlTag(xml, tag)
+    return string.match(xml or "", "<" .. tag .. ">([^<]*)</" .. tag .. ">")
+end
+
+-- The proxy answers GET_PROPERTIES with every dimmer setting and three buttons whatever the light
+-- supports (a Hue light too), so what the light has comes from the capabilities its driver declares
+-- (GET_CAPABILITIES). Without an answer to that, everything reported is kept.
+local function lightV2Has(caps, capability)
+    if caps == "" then
+        return true
+    end
+    return xmlTag(caps, capability) == "True"
+end
+
+-- Ask a Light V2 proxy for its settings and LED colors (GET_PROPERTIES), limits (GET_SETUP) and
+-- capabilities (GET_CAPABILITIES), and keep the settings and LEDs the light has. Returns the
+-- cached table, or nil if the proxy didn't answer.
+function RefreshLightV2Settings(proxyID)
+    proxyID = tonumber(proxyID)
+    local ok, xml = pcall(C4.SendUIRequest, C4, proxyID, "GET_PROPERTIES", {})
+    if not ok or type(xml) ~= "string" or xml == "" then
+        Log("Light V2 proxy " .. tostring(proxyID) .. ": no answer to GET_PROPERTIES")
+        gLightV2Settings[proxyID] = nil
+        return nil
+    end
+    local okSetup, setup = pcall(C4.SendUIRequest, C4, proxyID, "GET_SETUP", {})
+    local okCaps, caps = pcall(C4.SendUIRequest, C4, proxyID, "GET_CAPABILITIES", {})
+    caps = (okCaps and type(caps) == "string") and caps or ""
+    local settings = { values = {}, leds = {}, setup = (okSetup and type(setup) == "string") and setup or "" }
+    for suffix, control in pairs(DIMMER_CONTROL_VARS) do
+        local value = xmlTag(xml, control.tag)
+        -- The Default On preset also counts when the proxy has its variable: a Gen3 dimmer has
+        -- 1006 without declaring supports_default_on
+        local has = lightV2Has(caps, control.capability) or
+            (control.v2 ~= nil and C4:GetDeviceVariable(proxyID, control.v2) ~= nil)
+        if has and value and value ~= "" then
+            settings.values[suffix] = value
+        end
+    end
+    -- LEDs: a light with LEDs, or with buttons (the community Lua dimmer drives its LEDs itself and
+    -- declares has_leds False, but has button events)
+    local hasLeds = lightV2Has(caps, "has_leds") or lightV2Has(caps, "has_button_events")
+    for info in string.gmatch(hasLeds and xml or "", "<BUTTON_INFO>(.-)</BUTTON_INFO>") do
+        local id = tonumber(xmlTag(info, "BUTTON_ID"))
+        if id then
+            settings.leds[id] = { on = xmlTag(info, "ON_COLOR"), off = xmlTag(info, "OFF_COLOR") }
+        end
+    end
+    gLightV2Settings[proxyID] = settings
+    return settings
+end
+
+function GetLightV2Settings(proxyID)
+    return gLightV2Settings[tonumber(proxyID)] or RefreshLightV2Settings(proxyID)
+end
+
+-- Allowed range of an advanced control as Home Assistant shows it (hold rates in seconds).
+-- Light V2 lights give their own click and hold rate limits in GET_SETUP.
+local DIMMER_CONTROL_DEFAULT_RANGES = {
+    min_on_level = {0, 100}, max_on_level = {0, 100}, preset_level = {0, 100},
+    click_ramp_rate_up = {0, 5000}, click_ramp_rate_down = {0, 5000},
+    hold_ramp_rate_up = {0, 10}, hold_ramp_rate_down = {0, 10}
+}
+function GetDimmerControlRange(proxyID, suffix)
+    local default = DIMMER_CONTROL_DEFAULT_RANGES[suffix] or {0, 100}
+    local control = DIMMER_CONTROL_VARS[suffix]
+    if not (control and control.range and IsLightV2(proxyID)) then
+        return default[1], default[2]
+    end
+    local settings = GetLightV2Settings(proxyID)
+    local setup = settings and settings.setup or ""
+    local low, high = tonumber(xmlTag(setup, control.range .. "_MIN")), tonumber(xmlTag(setup, control.range .. "_MAX"))
+    if not (low and high) then
+        return default[1], default[2]
+    end
+    if control.seconds then
+        return low / 1000, high / 1000
+    end
+    return low, high
+end
 
 -- Light proxy variables (V1 and Light V2): their changes arrive with the proxy ID
 local LIGHT_PROXY_VARIABLES = {}
 for _, varID in ipairs({VARIABLE_IDS.SWITCH_STATE, VARIABLE_IDS.LIGHT_LEVEL, VARIABLE_IDS.CLICK_RAMP_RATE_UP,
-        VARIABLE_IDS.CLICK_RAMP_RATE_DOWN, VARIABLE_IDS.V2_HOLD_RATE_UP, VARIABLE_IDS.V2_HOLD_RATE_DOWN,
-        VARIABLE_IDS.V2_PRESET_LEVEL, VARIABLE_IDS.V2_MAX_ON_LEVEL, VARIABLE_IDS.V2_MIN_ON_LEVEL,
-        VARIABLE_IDS.CURRENT_CHROMATICITY, VARIABLE_IDS.CURRENT_COLOR_MODE, VARIABLE_IDS.CURRENT_CCT,
+        VARIABLE_IDS.CLICK_RAMP_RATE_DOWN, VARIABLE_IDS.PRESET_LEVEL, VARIABLE_IDS.MAX_ON_LEVEL,
+        VARIABLE_IDS.MIN_ON_LEVEL, VARIABLE_IDS.V2_PRESET_LEVEL, VARIABLE_IDS.CURRENT_CHROMATICITY, VARIABLE_IDS.CURRENT_COLOR_MODE, VARIABLE_IDS.CURRENT_CCT,
         VARIABLE_IDS.DYNAMIC_CAPABILITIES}) do
     LIGHT_PROXY_VARIABLES[varID] = true
 end
@@ -1006,8 +1090,8 @@ function GetDimmerControlVariable(proxyID, suffix)
     return control.v1
 end
 
--- Advanced control variables to watch: all of them on V1 dimmers, the ones the proxy has on
--- Light V2 lights (a Hue light has no hold rates or min/max)
+-- Advanced control variables to watch: all of them on V1 dimmers; on Light V2 lights only the
+-- Default On preset (1006), whose change also refreshes the other settings
 function GetDimmerControlVariables(proxyID)
     local isV2 = IsLightV2(proxyID)
     local varIDs = {}
@@ -1031,18 +1115,28 @@ function GetDimmerControlForVariable(proxyID, varID)
 end
 
 -- Current value of an advanced control as Home Assistant shows it (hold rates in seconds), or nil
--- if the light doesn't have it. V1 hold rates have no variable: the last value set from Home Assistant.
+-- if the light doesn't have it. Light V2: as the proxy last answered. V1 hold rates have no
+-- variable: the last value set from Home Assistant.
 function GetDimmerControlValue(deviceID, proxyID, suffix)
-    local varID = GetDimmerControlVariable(proxyID, suffix)
-    if varID then
-        local value = C4:GetDeviceVariable(proxyID, varID)
-        if value == nil or value == "" then
-            return nil
-        end
-        if DIMMER_CONTROL_VARS[suffix].seconds then
+    local control = DIMMER_CONTROL_VARS[suffix]
+    if not control then
+        return nil
+    end
+    local value
+    if IsLightV2(proxyID) then
+        local settings = GetLightV2Settings(proxyID)
+        value = settings and settings.values[suffix]
+    elseif control.v1 then
+        value = C4:GetDeviceVariable(proxyID, control.v1)
+    end
+    if value ~= nil and value ~= "" then
+        if control.seconds then
             return string.format("%g", (tonumber(value) or 0) / 1000)
         end
         return tostring(value)
+    end
+    if IsLightV2(proxyID) then
+        return nil
     end
     local rates = gHoldRampRates[deviceID]
     if suffix == "hold_ramp_rate_up" and rates and rates.up then
@@ -1381,6 +1475,10 @@ function RefreshAllDeviceStates(deviceType)
 
         if deviceType == "LIGHT" then
             PublishLightState(deviceID)
+            -- Light V2: read its settings and LED colors again (the proxy has no variables for them)
+            if IsLightV2(GetProxyID(deviceID)) and (IsLEDControlEnabled() or IsAdvancedDimmerControlEnabled()) then
+                RefreshLightV2Settings(GetProxyID(deviceID))
+            end
             -- Also publish LED states if enabled
             if IsLEDControlEnabled() then
                 PublishAllLEDStates(deviceID)
@@ -2934,10 +3032,18 @@ function OnWatchedVariableChanged(idDevice, idVariable, strValue)
         -- Advanced control variables come from proxy ID, so actualDeviceID should be the device ID
         -- Publish the individual control's state (V1 and Light V2 keep them under different IDs)
         local proxyID = GetProxyID(actualDeviceID)
-        local suffix = GetDimmerControlForVariable(proxyID, idVariable)
-        local value = GetDimmerControlValue(actualDeviceID, proxyID, suffix) or "0"
-        local stateTopic = "homeassistant/number/control4_" .. actualDeviceID .. "_" .. suffix .. "/state"
-        PublishMQTT(stateTopic, value, 1, true)  -- QoS 1, retained
+        if IsLightV2(proxyID) then
+            -- Light V2: the Default On preset changed. The other settings have no variable to
+            -- watch, so read them all again with it.
+            RefreshLightV2Settings(proxyID)
+            PublishDimmerAdvancedControlStates(actualDeviceID)
+            PublishAllLEDStates(actualDeviceID)
+        else
+            local suffix = GetDimmerControlForVariable(proxyID, idVariable)
+            local value = GetDimmerControlValue(actualDeviceID, proxyID, suffix) or "0"
+            local stateTopic = "homeassistant/number/control4_" .. actualDeviceID .. "_" .. suffix .. "/state"
+            PublishMQTT(stateTopic, value, 1, true)  -- QoS 1, retained
+        end
 
         local timestamp = os.date("%H:%M:%S")
         C4:UpdateProperty("Last Event", deviceName .. " @ " .. timestamp)
@@ -3405,6 +3511,19 @@ function PublishLEDDiscovery(deviceID, deviceType)
         return
     end
 
+    -- A Light V2 light without top and bottom buttons (a Hue light) has no LEDs: remove any
+    -- entities published for it before
+    local proxyID = GetProxyID(deviceID)
+    if IsLightV2(proxyID) then
+        local settings = RefreshLightV2Settings(proxyID)
+        if not (settings and settings.leds[0] and settings.leds[1]) then
+            for _, suffix in ipairs({"top_on", "top_off", "bottom_on", "bottom_off"}) do
+                PublishMQTT("homeassistant/text/control4_" .. deviceID .. "_" .. suffix .. "/config", "", 1, true)
+            end
+            return
+        end
+    end
+
     -- Define the 4 LED entities for this device
     local ledConfigs = {
         {
@@ -3469,9 +3588,29 @@ function PublishLEDDiscovery(deviceID, deviceType)
     Log("Published LED discovery for: " .. deviceName)
 end
 
+-- LED entity suffix -> Light V2 button ID and which of its colors
+local LIGHT_V2_LEDS = {
+    top_on = {button = 0, color = "on"}, top_off = {button = 0, color = "off"},
+    bottom_on = {button = 1, color = "on"}, bottom_off = {button = 1, color = "off"}
+}
+
 function PublishLEDState(deviceID, ledSuffix, variableID)
     if not IsLEDControlEnabled() then
         return
+    end
+
+    -- Light V2: the proxy keeps the button colors (GET_PROPERTIES)
+    local proxyID = GetProxyID(deviceID)
+    if IsLightV2(proxyID) then
+        local settings = GetLightV2Settings(proxyID)
+        local led = LIGHT_V2_LEDS[ledSuffix]
+        local button = settings and led and settings.leds[led.button]
+        local color = button and button[led.color]
+        if not color or color == "" then
+            return
+        end
+        local stateTopic = "homeassistant/text/control4_" .. deviceID .. "/" .. ledSuffix .. "/state"
+        return PublishMQTT(stateTopic, string.upper(color), 0, true)
     end
 
     -- LED variables exist on the device, not the proxy
@@ -3600,9 +3739,10 @@ function PublishDimmerAdvancedControlDiscovery(deviceID)
         }
     }
 
-    -- A Light V2 light has only the settings its proxy has variables for (a Hue light has no hold
-    -- rates or min/max): remove any entity published for the others before
+    -- A Light V2 light has only the settings its proxy reports (a Hue light has no hold rates or
+    -- min/max): remove any entity published for the others before. Its limits come from the proxy.
     if IsLightV2(proxyID) then
+        RefreshLightV2Settings(proxyID)
         local available = {}
         for _, control in ipairs(controls) do
             if GetDimmerControlValue(deviceID, proxyID, control.suffix) then
@@ -3619,6 +3759,7 @@ function PublishDimmerAdvancedControlDiscovery(deviceID)
         local discoveryTopic = "homeassistant/number/control4_" .. deviceID .. "_" .. control.suffix .. "/config"
         local objectID = SanitizeEntityName(dimmerName .. " " .. control.name)
 
+        local low, high = GetDimmerControlRange(proxyID, control.suffix)
         local config = {
             name = dimmerName .. " - " .. control.name,
             object_id = objectID,
@@ -3626,9 +3767,9 @@ function PublishDimmerAdvancedControlDiscovery(deviceID)
             unique_id = "control4_" .. deviceID .. "_" .. control.suffix,
             state_topic = "homeassistant/number/control4_" .. deviceID .. "_" .. control.suffix .. "/state",
             command_topic = "homeassistant/number/control4_" .. deviceID .. "_" .. control.suffix .. "/set",
-            min = control.min,
-            max = control.max,
-            step = 1,
+            min = low,
+            max = high,
+            step = (control.unit == "s" and IsLightV2(proxyID)) and 0.1 or 1,  -- Light V2 hold rates are in ms
             mode = "box",
             unit_of_measurement = control.unit,
             icon = control.icon,
@@ -3651,6 +3792,22 @@ function PublishDimmerAdvancedControlDiscovery(deviceID)
     PublishDimmerAdvancedControlStates(deviceID)
 
     return true
+end
+
+-- Read a Light V2 light's settings and LED colors back once, a little after a change from Home
+-- Assistant, and publish them: what the light took, or the old value if it refused.
+gLightV2ConfirmTimers = {}
+function ConfirmLightV2Settings(deviceID)
+    local pending = gLightV2ConfirmTimers[deviceID]
+    if pending then
+        pcall(function() pending:Cancel() end)
+    end
+    gLightV2ConfirmTimers[deviceID] = SafeSetTimer(TIMER_INTERVALS.LIGHT_V2_CONFIRM, function()
+        gLightV2ConfirmTimers[deviceID] = nil
+        RefreshLightV2Settings(GetProxyID(deviceID))
+        PublishDimmerAdvancedControlStates(deviceID)
+        PublishAllLEDStates(deviceID)
+    end)
 end
 
 function PublishDimmerAdvancedControlStates(deviceID)
@@ -4324,9 +4481,27 @@ function HandleMQTTCommand(topic, payload)
             return
         end
 
-        -- Send command to Control4 device (not proxy)
-        Log("Sending LED command to device " .. deviceID .. " (proxy " .. proxyID .. "): " .. command .. " with color " .. hexColor)
-        C4:SendToDevice(deviceID, command, {RGB = hexColor})
+        if IsLightV2(proxyID) then
+            -- Light V2: SET_BUTTON_COLOR to the proxy, with the button's other color as it is
+            local led = LIGHT_V2_LEDS[ledSuffix]
+            local settings = GetLightV2Settings(proxyID)
+            local button = settings and settings.leds[led.button] or {}
+            local colors = { on = button.on, off = button.off }
+            colors[led.color] = string.lower(hexColor)
+            if not (colors.on and colors.off) then
+                LogError("LED colors of " .. deviceID .. " unknown: not sent")
+                return
+            end
+            Log("Sending SET_BUTTON_COLOR to proxy " .. proxyID .. ": button " .. led.button ..
+                " on " .. colors.on .. " off " .. colors.off)
+            C4:SendToDevice(proxyID, "SET_BUTTON_COLOR", {BUTTON_ID = led.button, ON_COLOR = colors.on, OFF_COLOR = colors.off})
+            button[led.color] = colors[led.color]   -- so a second change before the read keeps this one
+            ConfirmLightV2Settings(deviceID)
+        else
+            -- Send command to Control4 device (not proxy)
+            Log("Sending LED command to device " .. deviceID .. " (proxy " .. proxyID .. "): " .. command .. " with color " .. hexColor)
+            C4:SendToDevice(deviceID, command, {RGB = hexColor})
+        end
 
         -- Publish state back to Home Assistant immediately
         local variableMap = {
@@ -4384,6 +4559,7 @@ function HandleMQTTCommand(topic, payload)
 
         local proxyID = GetProxyID(dimmerID)
         local dimmerName = C4:GetDeviceDisplayName(proxyID)
+        control.min, control.max = GetDimmerControlRange(proxyID, controlSuffix)
 
         -- Parse and validate value
         local value = tonumber(payload)
@@ -4438,7 +4614,7 @@ function HandleMQTTCommand(topic, payload)
                     LogError(errorMsg)
 
                     -- Revert to current valid value in HA (visual feedback)
-                    local currentValue = C4:GetDeviceVariable(proxyID, VARIABLE_IDS.CLICK_RAMP_RATE_UP) or "0"
+                    local currentValue = GetDimmerControlValue(dimmerID, proxyID, controlSuffix) or "0"
                     local stateTopic = "homeassistant/number/control4_" .. dimmerID .. "_" .. controlSuffix .. "/state"
                     PublishMQTT(stateTopic, currentValue, 1, true)
 
@@ -4457,7 +4633,7 @@ function HandleMQTTCommand(topic, payload)
                     LogError(errorMsg)
 
                     -- Revert to current valid value in HA (visual feedback)
-                    local currentValue = C4:GetDeviceVariable(proxyID, VARIABLE_IDS.CLICK_RAMP_RATE_DOWN) or "0"
+                    local currentValue = GetDimmerControlValue(dimmerID, proxyID, controlSuffix) or "0"
                     local stateTopic = "homeassistant/number/control4_" .. dimmerID .. "_" .. controlSuffix .. "/state"
                     PublishMQTT(stateTopic, currentValue, 1, true)
 
@@ -4467,7 +4643,7 @@ function HandleMQTTCommand(topic, payload)
                 end
             end
         elseif controlSuffix == "hold_ramp_rate_up" then
-            local clickRampUp = tonumber(C4:GetDeviceVariable(proxyID, VARIABLE_IDS.CLICK_RAMP_RATE_UP)) or 0
+            local clickRampUp = tonumber(GetDimmerControlValue(dimmerID, proxyID, "click_ramp_rate_up")) or 0
             local valueInMs = value * 1000  -- Convert seconds to ms
             if valueInMs < clickRampUp then
                 local errorMsg = "Hold Ramp Rate Up (" .. valueInMs .. "ms) must be >= Click Ramp Rate Up (" .. clickRampUp .. "ms)"
@@ -4485,7 +4661,7 @@ function HandleMQTTCommand(topic, payload)
                 return
             end
         elseif controlSuffix == "hold_ramp_rate_down" then
-            local clickRampDown = tonumber(C4:GetDeviceVariable(proxyID, VARIABLE_IDS.CLICK_RAMP_RATE_DOWN)) or 0
+            local clickRampDown = tonumber(GetDimmerControlValue(dimmerID, proxyID, "click_ramp_rate_down")) or 0
             local valueInMs = value * 1000  -- Convert seconds to ms
             if valueInMs < clickRampDown then
                 local errorMsg = "Hold Ramp Rate Down (" .. valueInMs .. "ms) must be >= Click Ramp Rate Down (" .. clickRampDown .. "ms)"
@@ -4507,10 +4683,13 @@ function HandleMQTTCommand(topic, payload)
         -- Execute the command
         local isV2 = IsLightV2(proxyID)
         if isV2 then
-            -- Light V2: the proxy's own setting commands (its variables are laid out differently)
+            -- Light V2: the proxy's own setting commands. The light answers the proxy in its own
+            -- time (a Zigbee dimmer after the device confirms), so read the settings back once
+            -- shortly after: Home Assistant shows what the light actually took.
             local spec = DIMMER_CONTROL_VARS[controlSuffix]
             local setting = spec.seconds and math.floor(value * 1000 + 0.5) or value
             C4:SendToDevice(proxyID, spec.command, {[spec.param] = setting})
+            ConfirmLightV2Settings(dimmerID)
         elseif control.varID == VARIABLE_IDS.CLICK_RAMP_RATE_UP then
             C4:SendToDevice(dimmerID, "SET_CLICK_RAMP_RATE_UP", {RATE = value})
         elseif control.varID == VARIABLE_IDS.CLICK_RAMP_RATE_DOWN then
@@ -4532,12 +4711,10 @@ function HandleMQTTCommand(topic, payload)
             C4:SetDeviceVariable(proxyID, control.varID, value)
         end
 
-        -- Publish state back to Home Assistant immediately (Light V2 lights report the new value
-        -- through their variable, so a setting the light doesn't take shows as it is)
-        if not isV2 then
-            local stateTopic = "homeassistant/number/control4_" .. dimmerID .. "_" .. controlSuffix .. "/state"
-            PublishMQTT(stateTopic, tostring(value), 1, true)  -- QoS 1, retained
-        end
+        -- Publish state back to Home Assistant immediately (a Light V2 setting the light doesn't
+        -- take is put back by the read that follows)
+        local stateTopic = "homeassistant/number/control4_" .. dimmerID .. "_" .. controlSuffix .. "/state"
+        PublishMQTT(stateTopic, tostring(value), 1, true)  -- QoS 1, retained
 
         Log("Advanced dimmer control set: " .. dimmerName .. " " .. control.name .. " = " .. value .. control.unit)
         C4:UpdateProperty("Last Command", dimmerName .. " " .. control.name .. " @ " .. os.date("%H:%M:%S"))
