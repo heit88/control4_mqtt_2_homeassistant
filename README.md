@@ -6,7 +6,7 @@ Updates are event-driven, with no polling. The driver holds an open MQTT connect
 
 ## Supported devices
 
-- Lights and dimmers, including Light V2 color lights
+- Lights and dimmers: V1 (`light.c4i`) and Light V2 (`light_v2.c4i`) proxies, including Gen3 dimmers, switches and keypad dimmers, and Light V2 color lights (see [Light V2 and Gen3 lights](#light-v2-and-gen3-lights))
 - Switches
 - Wireless outlet switches (see [Outlets](#outlets))
 - Thermostats
@@ -41,6 +41,31 @@ Outlets appear in Home Assistant as switches. **Auto-Discover All Devices** find
 
 **Cleanup Deleted Devices** removes deleted lights, switches and outlets from the monitored lists and from Home Assistant.
 
+## Light V2 and Gen3 lights
+
+Gen3 dimmers, switches and keypad dimmers use Control4's Light V2 proxy (`light_v2.c4i`), as do the Hue Light driver, the community gen2 Lua dimmers and switches, and the WLED driver. **Auto-Discover All Devices** finds them alongside V1 lights, with nothing extra to set up.
+
+- **Proxy selection:** a device can have more than one proxy. A Gen3 keypad dimmer has a light proxy and a keypad proxy, and the driver uses the Light V2 one. State is read from that proxy, and commands are sent to it.
+- **On, off and brightness:** level and on/off state come from the same proxy variables as on V1 lights. Commands from Home Assistant are sent straight to the proxy, with no delay or batching:
+
+  | Home Assistant command | Sent to the proxy |
+  |---|---|
+  | Turn on, no brightness | `ON` (the light goes to its Default On level) |
+  | Brightness | `SET_LEVEL` |
+  | Brightness with a transition | `RAMP_TO_LEVEL` with `TIME` in ms |
+  | Turn off | `OFF` |
+  | Turn off with a transition | `RAMP_TO_LEVEL` to 0 |
+
+  The ramp time is Home Assistant's `transition` in seconds, converted to ms. V1 lights ignore `transition`.
+- **Dimmer or switch:** a light with a level is published as a dimmer (`brightness`), and one with only an on/off state as `onoff`. A Gen3 switch shows as a light that is on or off. List its device ID in **Switch Device IDs** to make it a Home Assistant switch instead.
+- **Color:** a light is published as a color light only if its proxy's capabilities (variable 6661) declare it. With color temperature it gets `color_temp`, in Kelvin, limited to the light's own range. With full color it gets `xy`. Gen3 dimmers declare neither, so they stay plain dimmers.
+  - The current color is read from variables 1200, 1201 and 1202.
+  - A color from Home Assistant goes to the proxy as `SET_COLOR_TARGET`, using the transition as its rate.
+  - Changing the color of a light that is on doesn't send `ON`, so the light doesn't jump to its Default On level.
+  - If a light only reports its capabilities after it is discovered, its Home Assistant entity is published again with them.
+- **Dimmer settings and LEDs:** see the next section. A Gen3 dimmer's settings and top and bottom LED colors are read from the proxy. This was confirmed on a Gen3 dimmer on OS 3.4.3.
+- **Settings changed in Control4:** brightness, state and color changes made in Control4 reach Home Assistant at once. Dimmer settings changed in Composer or on a touchscreen reach it later on a Gen3 dimmer (see [Future work](#future-work)).
+
 ## Dimmer settings and LED colors on Light V2 lights
 
 With **Enable Advanced Dimmer Controls** and **Enable LED Color Control**, dimmers get number entities for their settings (preset, min/max on level, click and hold rates) and text entities for their top and bottom button LED colors.
@@ -49,7 +74,7 @@ A Light V2 light (Gen3 dimmers, Hue lights, the community Lua dimmers) keeps the
 
 - It shows only the settings and LEDs the light's driver declares in its capabilities (`click_rates`, `hold_rates`, `min_max`, `supports_default_on`, `has_leds` or `has_button_events`), with the click and hold rate ranges the light reports. The proxy itself reports every setting and three buttons for any light, so a Hue light gets just its preset and click rates.
 - Changes from Home Assistant go to the proxy (`SET_PRESET_LEVEL`, `SET_HOLD_RATE_UP`, `SET_BUTTON_COLOR`, ...), and the settings are read back 3 seconds later, so a value the light refused is put back.
-- Settings are read again on connect, when a light is discovered, and whenever its Default On preset changes. The proxy announces nothing when another setting is changed in Composer or on a touchscreen, so a light driver can announce it instead: from version 4.8 the driver watches a driver variable named `SETTINGS_CHANGED` on the light's own driver, and reads the settings again whenever it changes. The Hue Light driver has it from v0.4.6. For lights without it (Gen3 dimmers), such a change reaches Home Assistant at the next of the reads above.
+- Settings are read again on connect, when a light is discovered, and whenever its Default On preset changes. The proxy announces nothing when another setting is changed in Composer or on a touchscreen, so a light driver can announce it instead: from version 4.8 the driver watches a driver variable named `SETTINGS_CHANGED` on the light's own driver, and reads the settings again whenever it changes. The Hue Light driver has it from v0.4.6, and the community gen2 Lua dimmers and switches from v20. For lights without it (Gen3 dimmers), such a change reaches Home Assistant at the next of the reads above.
 
 V1 lights work as before.
 
@@ -87,7 +112,7 @@ From version 4.10:
 | Light | Driver | Live updates |
 |---|---|---|
 | Hue Light | ours | yes, from v0.4.6 |
-| Community gen2 Lua dimmers and switches | ours | not yet: add `SETTINGS_CHANGED` as the Hue Light driver does |
+| Community gen2 Lua dimmers and switches | ours | yes, from v20 |
 | Gen3 dimmers | Control4's | no: the driver can't be changed |
 
 To investigate for Gen3, without polling:
