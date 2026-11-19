@@ -153,6 +153,16 @@ mock.byfile["outlet_light.c4i"] = lua.table()
 g.DiscoverAllDevices("OUTLET")
 check(monitored("OUTLET") == [], f"discovery with no outlets left clears deleted ones: {monitored('OUTLET')}")
 
+# another build of the community outlet driver, under a different file name
+lua.execute(r'''
+mock.proxies[950] = "951"
+mock.names[950], mock.names[951] = "Outlet Switch v2", "Garage Outlet"
+mock.vars[951] = { [1000] = "0" }
+mock.devices[950] = { driverFileName = "outlet_switch_loz5s1_lua_v2.c4z", proxies = { [951] = {} } }
+mock.byfile["light_v2.c4i"]["951"] = "Garage Outlet"
+''')
+check(951 in g.FindOutletProxies().values(), "a differently named build of the Lua outlet driver (outlet_switch_loz5s1*) is an outlet")
+
 print()
 if failures:
     print(f"{len(failures)} FAILED")

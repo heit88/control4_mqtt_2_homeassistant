@@ -2,10 +2,24 @@
 -- Author: John Heit
 -- Copyright 2025 Heit Automation
 -- Licensed under the MIT License, see the LICENSE file
--- Version 4.6 - Native C4 Network Stack (Event-Driven), Light V2 color lights, all outlet driver generations
+-- Version 4.10 - Native C4 Network Stack (Event-Driven), Light V2 color lights, all outlet driver generations,
+-- bridge availability (MQTT Will), automatic discovery on Home Assistant restart, devices deleted from the
+-- project removed from Home Assistant
 
 -- Constants
+local DRIVER_VERSION = "4.10"  -- keep in step with <version> in driver.xml
 local MQTT_BINDING_ID = 6001  -- Network binding ID for MQTT broker connection
+
+-- Bridge availability: the broker publishes "offline" here (the MQTT Will) when the connection to the
+-- controller is lost; the driver publishes "online" when it connects. Every entity depends on it.
+local BRIDGE_STATUS_TOPIC = "control4/bridge/status"
+-- Home Assistant's birth message: "online" when Home Assistant (re)starts, so discovery is sent again
+local HA_STATUS_TOPIC = "homeassistant/status"
+-- Command topics: every /set topic the driver's entities use has one of these two shapes
+--   homeassistant/<component>/<object>/set        light, switch, outlet, media_player, number, thermostat LED text
+--   homeassistant/<component>/<object>/<x>/set    climate (mode, temperature, ...), LED text (top_on, ...)
+local COMMAND_TOPIC_FILTERS = {"homeassistant/+/+/set", "homeassistant/+/+/+/set"}
+local MQTT_KEEPALIVE_SECONDS = 60  -- keep alive in CONNECT; no packet from the broker for 1.5x this = dead
 local VARIABLE_IDS = {
     LIGHT_LEVEL = 1001,
     SWITCH_STATE = 1000,
@@ -118,7 +132,14 @@ local TIMER_INTERVALS = {
     DISCOVERY_DELAY = 500,
     AUTO_CONNECT_DELAY = 500,  -- Reduced from 3000ms for faster command response
     RECONNECT_DELAY = 2000,
-    LIGHT_V2_CONFIRM = 3000    -- after a Light V2 setting or LED change, read the light's settings back
+    LIGHT_V2_CONFIRM = 3000,   -- after a Light V2 setting or LED change, read the light's settings back
+    KEEPALIVE_TICK = 15000,    -- how often the connection's liveness is checked
+    PINGREQ_INTERVAL = 45,     -- seconds between PINGREQs
+    RECONNECT_MIN = 2000,      -- reconnect backoff after a lost connection: 2 s, doubling to 60 s
+    RECONNECT_MAX = 60000,
+    STATS_PROPERTY_INTERVAL = 10, -- seconds between updates of the Messages Sent / Received properties
+    SETTINGS_CHANGED_RESCAN = 45000, -- after start-up, look again for SETTINGS_CHANGED on light drivers that create it late
+    DELETED_MISS_SPACING = 60  -- a light is only taken as deleted after 3 misses at least this many seconds apart
 }
 
 local LIMITS = {
@@ -212,6 +233,10 @@ local OUTLET_DRIVER_FILES = {
     "outlet_nondimmable_light.c4i",
     "outlet_switch_loz5s1_lua.c4z"
 }
+-- driverFileName patterns that are outlets too (other builds / renamed copies of the community driver)
+local OUTLET_DRIVER_PATTERNS = {
+    "^outlet_switch_loz5s1"
+}
 
 -- Global Variables
 local gConnected = false
@@ -238,6 +263,24 @@ local gActiveTimers = {} -- One-shot timers that haven't fired yet, for cleanup:
 local gHoldRampRates = {} -- Track hold ramp rates for dimmers: [deviceID] = {up = ms, down = ms}
 local gLightV2Proxies = nil -- Light V2 proxy IDs in the project: [proxyID] = true (built on first use)
 local gOutletProxies = nil -- Outlet proxy IDs in the project: [proxyID] = true (built on first use)
+local gConnIP, gConnPort = nil, nil -- Broker address of the current connection (properties may change under it)
+local gConnecting = false -- A TCP connect is under way (ConnectToBroker called, no ONLINE/OFFLINE yet)
+local gConnectStarted = 0
+local gReconnectTimer = nil -- The one pending reconnect (single in flight)
+local gReconnectAttempts = 0 -- For the backoff; reset by a CONNACK
+local gLastInbound = 0 -- os.time() of the last packet from the broker
+local gLastPingSent = 0
+local gLastPublished = {} -- Last payload published per topic (this connection): unchanged state isn't sent again
+local gSkipUnchanged = false -- Set while a state change is published: PublishMQTT skips unchanged payloads
+local gDiscoveryInProgress = false -- A paced discovery run is going
+local gDiscoveryRerun = false -- Home Assistant restarted during it: run once more when it ends
+local gRetainedSetLogged = {} -- Retained /set topics already logged (logged once each)
+local gLightMisses = {} -- Lights whose name couldn't be read: [deviceID] = {count = n, last = os.time()}
+local gLightColorCapsSig = {} -- Color capabilities last published in a light's discovery: [deviceID] = "sig"
+local gStatsTimer = nil
+local gLastStatsUpdate = 0
+local gRescanTimer = nil
+local gDeviceLookup = nil -- Monitored device sets and proxy -> device maps (see GetDeviceLookup)
 local gStats = {
     messagesReceived = 0,
     messagesSent = 0,
@@ -301,11 +344,29 @@ function SafeSetTimer(delay, callback, repeating)
     return timer
 end
 
+-- Cancel a timer object from C4:SetTimer / SafeSetTimer (nil is fine)
+function CancelTimerObject(timer)
+    if type(timer) == "table" or type(timer) == "userdata" then
+        pcall(function() timer:Cancel() end)
+        gActiveTimers[timer] = nil
+    end
+end
+
+-- A timer that isn't cancelled with the connection's timers, with its callback protected
+function SetUntrackedTimer(delay, callback)
+    return C4:SetTimer(delay, function(firedTimer)
+        local ok, err = pcall(callback, firedTimer)
+        if not ok then
+            LogError("Timer callback error: " .. tostring(err))
+        end
+    end, false)
+end
+
 -- Initialization
 function OnDriverInit()
     Log("========================================")
     Log("Control4 to Home Assistant MQTT Bridge")
-    Log("Author: John Heit - Version 4.6")
+    Log("Author: John Heit - Version " .. DRIVER_VERSION)
     Log("Bidirectional Control + Auto-Discovery")
     Log("Contact Sensor Support (Auto-Detection)")
     Log("========================================")
@@ -405,6 +466,34 @@ function OnDriverLateInit()
 
     -- Start connection watchdog
     StartConnectionWatchdog()
+
+    -- Remove a monitored device from Home Assistant when it is deleted from the project
+    RememberTrackedNames()
+    local ok, err = pcall(RegisterProjectEvents)
+    if not ok then
+        LogError("Registering system events failed: " .. tostring(err))
+    end
+
+    -- A light driver may create its SETTINGS_CHANGED variable after this driver started (drivers
+    -- start in any order): look again once everything is up. Not a connection timer, so a
+    -- disconnect doesn't cancel it.
+    if gRescanTimer then
+        pcall(function() gRescanTimer:Cancel() end)
+    end
+    gRescanTimer = C4:SetTimer(TIMER_INTERVALS.SETTINGS_CHANGED_RESCAN, function()
+        gRescanTimer = nil
+        local ok, err = pcall(function()
+            for _, lightID in ipairs(gMonitoredLights) do
+                ResolveSettingsChangedVariable(lightID)
+            end
+            for _, switchID in ipairs(gMonitoredSwitches) do
+                ResolveSettingsChangedVariable(switchID)
+            end
+        end)
+        if not ok then
+            LogError("SETTINGS_CHANGED rescan failed: " .. tostring(err))
+        end
+    end, false)
 end
 
 -- Load Contact Sensor Binding Map from driver property
@@ -689,14 +778,14 @@ function StartConnectionWatchdog()
             if not gMQTTConnected and gConnected then
                 -- Connected to TCP but not MQTT - something is wrong
                 LogError("Watchdog: MQTT disconnected, reconnecting...")
-                gStats.reconnects = gStats.reconnects + 1
                 DisconnectFromBroker()
-                SafeSetTimer(TIMER_INTERVALS.RECONNECT_DELAY, function()
-                    ConnectToBroker()
-                end)
+                ScheduleReconnect()
             elseif not gConnected then
-                -- Not connected at all
-                if IsBrokerConfigured() then
+                -- Not connected at all: unless a reconnect is already pending or a connect is
+                -- under way (one in flight at a time)
+                if gReconnectTimer or (gConnecting and os.time() - gConnectStarted < 30) then
+                    Log("Watchdog: reconnect already pending")
+                elseif IsBrokerConfigured() then
                     Log("Watchdog: Not connected, attempting connection...")
                     gStats.reconnects = gStats.reconnects + 1
                     ConnectToBroker()
@@ -713,11 +802,15 @@ function OnDriverDestroyed()
     Log("Driver shutting down...")
     Log("Statistics - Sent: " .. gStats.messagesSent .. ", Received: " .. gStats.messagesReceived .. ", Errors: " .. gStats.errors)
 
+    -- Tell Home Assistant the bridge is going away (the broker would also send the Will once the
+    -- connection closes, but this is immediate)
+    if gMQTTConnected then
+        PublishMQTT(BRIDGE_STATUS_TOPIC, "offline", 1, true)
+    end
+
     -- Cancel all media room debounce timers
-    for roomID, timerID in pairs(gMediaRoomDebounceTimers) do
-        if timerID and type(timerID) == "number" then
-            pcall(function() C4:KillTimer(timerID) end)
-        end
+    for roomID, timer in pairs(gMediaRoomDebounceTimers) do
+        CancelTimerObject(timer)
     end
     gMediaRoomDebounceTimers = {}
 
@@ -728,6 +821,10 @@ function OnDriverDestroyed()
             pcall(function() C4:UnregisterDeviceEvent(roomID, eventID) end)
         end
     end
+
+    pcall(UnregisterProjectEvents)
+    CancelTimerObject(gDeleteCheckTimer)
+    CancelTimerObject(gDeleteConfirmTimer)
 
     CancelTimers()
     SaveMonitoredLights()
@@ -758,9 +855,18 @@ function OnPropertyChanged(prop)
             end)
         end
 
-    elseif (prop == "MQTT Broker IP" or prop == "MQTT Broker Port" or
-        prop == "MQTT Username" or prop == "MQTT Password") and gConnected then
-        Log("Connection settings changed - reconnect required")
+    elseif prop == "MQTT Broker IP" or prop == "MQTT Broker Port" or
+        prop == "MQTT Username" or prop == "MQTT Password" then
+        -- Reconnect with the new settings (the old connection is closed on the address it was
+        -- opened with), unless the Disconnect action was used
+        if (gConnected or gConnecting or gReconnectTimer) and not gManualDisconnect then
+            Log("Connection settings changed - reconnecting")
+            DisconnectFromBroker()
+            if IsBrokerConfigured() then
+                gReconnectAttempts = 0
+                ScheduleReconnect(true)
+            end
+        end
     elseif prop == "Switch Device IDs (comma separated)" then
         Log("Switch Device IDs property changed - reloading...")
         LoadSwitchIDsFromProperty()
@@ -823,6 +929,7 @@ function RefreshLightV2Proxies()
     for proxyID in pairs(C4:GetDevicesByC4iName("light_v2.c4i") or {}) do
         gLightV2Proxies[tonumber(proxyID)] = true
     end
+    InvalidateDeviceLookup()  -- proxy resolution can change with it
 end
 
 function IsLightV2(proxyID)
@@ -901,9 +1008,22 @@ function FindOutletProxies()
         end
     end
 
+    local function isOutletFile(fileName)
+        fileName = string.lower(tostring(fileName))
+        if wanted[fileName] then
+            return true
+        end
+        for _, pattern in ipairs(OUTLET_DRIVER_PATTERNS) do
+            if string.find(fileName, pattern) then
+                return true
+            end
+        end
+        return false
+    end
+
     for deviceID, deviceInfo in pairs(C4:GetDevices() or {}) do
         local fileName = type(deviceInfo) == "table" and deviceInfo.driverFileName
-        if fileName and wanted[string.lower(tostring(fileName))] then
+        if fileName and isOutletFile(fileName) then
             local proxies = {}
             for proxyID in pairs(deviceInfo.proxies or {}) do
                 table.insert(proxies, proxyID)
@@ -913,6 +1033,7 @@ function FindOutletProxies()
     end
 
     table.sort(found)
+    InvalidateDeviceLookup()
     return found
 end
 
@@ -942,6 +1063,15 @@ function GetLightColorCaps(proxyID)
         result.maxK = tonumber(string.match(caps, "<color_correlated_temperature_max>%s*(%d+)")) or 6500
     end
     return result
+end
+
+-- The color capabilities as a string, to tell when they change (what discovery depends on)
+function ColorCapsSignature(proxyID)
+    local caps = GetLightColorCaps(proxyID)
+    if not caps then
+        return "none"
+    end
+    return tostring(caps.color) .. ":" .. tostring(caps.minK) .. ":" .. tostring(caps.maxK)
 end
 
 -- Is a CIE xy color on the white (Planckian) curve, i.e. a color temperature?
@@ -982,6 +1112,18 @@ local DIMMER_CONTROL_VARS = {
 -- { values = {suffix = "text"}, leds = {[buttonID] = {on = "rrggbb", off = "rrggbb"}}, setup = "<setup>..." }
 gLightV2Settings = {}
 
+-- While set, Light V2 settings come from gLightV2Settings only (no C4:SendUIRequest)
+gSettingsCacheOnly = false
+function RunWithCachedSettings(fn)
+    local previous = gSettingsCacheOnly
+    gSettingsCacheOnly = true
+    local ok, err = pcall(fn)
+    gSettingsCacheOnly = previous
+    if not ok then
+        LogError("Publish from cached settings failed: " .. tostring(err))
+    end
+end
+
 local function xmlTag(xml, tag)
     return string.match(xml or "", "<" .. tag .. ">([^<]*)</" .. tag .. ">")
 end
@@ -1001,6 +1143,11 @@ end
 -- cached table, or nil if the proxy didn't answer.
 function RefreshLightV2Settings(proxyID)
     proxyID = tonumber(proxyID)
+    -- Automatic runs (connect, Home Assistant restart) never ask the proxy: SendUIRequest blocks,
+    -- and a command from Home Assistant arriving meanwhile would wait. What is cached, or nil.
+    if gSettingsCacheOnly then
+        return gLightV2Settings[proxyID]
+    end
     local ok, xml = pcall(C4.SendUIRequest, C4, proxyID, "GET_PROPERTIES", {})
     if not ok or type(xml) ~= "string" or xml == "" then
         Log("Light V2 proxy " .. tostring(proxyID) .. ": no answer to GET_PROPERTIES")
@@ -1036,6 +1183,57 @@ end
 
 function GetLightV2Settings(proxyID)
     return gLightV2Settings[tonumber(proxyID)] or RefreshLightV2Settings(proxyID)
+end
+
+-- A light driver can announce changes to its settings, which its Light V2 proxy doesn't, with a
+-- driver variable of this name that changes with each one (the Hue Light driver from v0.4.6).
+-- Watched variable ID by device ID.
+local SETTINGS_CHANGED_VAR = "SETTINGS_CHANGED"
+gSettingsChangedVars = {}
+
+function FindSettingsChangedVariable(deviceID)
+    for varID, var in pairs(C4:GetDeviceVariables(deviceID) or {}) do
+        if type(var) == "table" and var.name == SETTINGS_CHANGED_VAR then
+            return tonumber(varID)
+        end
+    end
+    return nil
+end
+
+-- Look up (by name) a light's SETTINGS_CHANGED variable again and watch it: at start-up, when the
+-- light's capabilities change, and once a little after start-up (a light driver may add the
+-- variable after this driver started, or a driver update may renumber it).
+function ResolveSettingsChangedVariable(deviceID)
+    deviceID = tonumber(deviceID)
+    if not deviceID then
+        return
+    end
+    local wanted = nil
+    if IsLightV2(GetProxyID(deviceID)) and (IsLEDControlEnabled() or IsAdvancedDimmerControlEnabled()) then
+        wanted = FindSettingsChangedVariable(deviceID)
+    end
+    local current = gSettingsChangedVars[deviceID]
+    if current == wanted then
+        return
+    end
+    if current then
+        C4:UnregisterVariableListener(deviceID, current)
+    end
+    if wanted then
+        C4:RegisterVariableListener(deviceID, wanted)
+        Log("Watching SETTINGS_CHANGED (variable " .. wanted .. ") of light " .. deviceID)
+    end
+    gSettingsChangedVars[deviceID] = wanted
+end
+
+-- A Light V2 light's settings changed outside Home Assistant: read them again and publish them
+function PublishLightV2SettingsChanged(deviceID)
+    if not gMQTTConnected then
+        return
+    end
+    RefreshLightV2Settings(GetProxyID(deviceID))
+    PublishDimmerAdvancedControlStates(deviceID)
+    PublishAllLEDStates(deviceID)
 end
 
 -- Allowed range of an advanced control as Home Assistant shows it (hold rates in seconds).
@@ -1185,18 +1383,83 @@ function GetMonitoredList(deviceType)
     return {}
 end
 
--- Check if a device is being monitored
-function IsDeviceMonitored(deviceID, deviceType)
-    local list = GetMonitoredList(deviceType)
-    local config = DEVICE_TYPES[deviceType]
+-- Monitored devices by type as sets, and the proxy -> device maps that variable changes (which
+-- arrive with the proxy ID) are looked up in. Built once and rebuilt only when a monitored list or
+-- the proxy lookup changes, instead of resolving every monitored device's proxy on every change.
+local LOOKUP_TYPES = {"LIGHT", "SWITCH", "OUTLET", "THERMOSTAT", "MEDIA_ROOM", "CONTACT_SENSOR"}
 
-    for _, item in ipairs(list) do
-        local id = (config.uses_table and item.id) or item
-        if id == deviceID then
-            return true
+function InvalidateDeviceLookup()
+    gDeviceLookup = nil
+end
+
+function GetDeviceLookup()
+    local lookup = gDeviceLookup
+    if lookup then
+        -- A list replaced or resized without going through a save also counts as a change
+        for _, deviceType in ipairs(LOOKUP_TYPES) do
+            local list = GetMonitoredList(deviceType)
+            if lookup.lists[deviceType] ~= list or lookup.counts[deviceType] ~= #list then
+                lookup = nil
+                break
+            end
+        end
+        if lookup then
+            return lookup
         end
     end
-    return false
+
+    -- Resolve the Light V2 / outlet proxy sets first: refreshing them invalidates the lookup
+    if not gLightV2Proxies then
+        RefreshLightV2Proxies()
+    end
+    if not gOutletProxies then
+        FindOutletProxies()
+    end
+
+    lookup = { sets = {}, lists = {}, counts = {}, lightProxy = {}, thermostatProxy = {} }
+    for _, deviceType in ipairs(LOOKUP_TYPES) do
+        local list = GetMonitoredList(deviceType)
+        local config = DEVICE_TYPES[deviceType]
+        local set = {}
+        for _, item in ipairs(list) do
+            local id = tonumber((config.uses_table and item.id) or item)
+            if id then
+                set[id] = true
+            end
+        end
+        lookup.sets[deviceType] = set
+        lookup.lists[deviceType] = list
+        lookup.counts[deviceType] = #list
+    end
+    -- Light proxy variables: as before, the first device of a list with that proxy, and an outlet
+    -- over a switch over a light
+    for _, deviceType in ipairs({"LIGHT", "SWITCH", "OUTLET"}) do
+        local typeMap = {}
+        for _, deviceID in ipairs(GetMonitoredList(deviceType)) do
+            local proxyID = tonumber(GetProxyID(deviceID))
+            if proxyID and typeMap[proxyID] == nil then
+                typeMap[proxyID] = deviceID
+            end
+        end
+        for proxyID, deviceID in pairs(typeMap) do
+            lookup.lightProxy[proxyID] = deviceID
+        end
+    end
+    for _, deviceID in ipairs(gMonitoredThermostats) do
+        local proxyID = tonumber(GetProxyID(deviceID))
+        if proxyID and lookup.thermostatProxy[proxyID] == nil then
+            lookup.thermostatProxy[proxyID] = deviceID
+        end
+    end
+    gDeviceLookup = lookup
+    return lookup
+end
+
+-- Check if a device is being monitored
+function IsDeviceMonitored(deviceID, deviceType)
+    local set = GetDeviceLookup().sets[deviceType]
+    local id = tonumber(deviceID)
+    return set ~= nil and id ~= nil and set[id] == true
 end
 
 -- Generic device loading from persistence
@@ -1251,6 +1514,7 @@ function SaveMonitoredDevices(deviceType)
     end
 
     C4:PersistSetValue(config.storage_key, saveStr)
+    InvalidateDeviceLookup()
 end
 
 -- Generic device count updater
@@ -1266,6 +1530,7 @@ end
 -- For media rooms: device ID = proxy ID, registers directly
 function SubscribeToDevice(deviceID, deviceType)
     local config = DEVICE_TYPES[deviceType]
+    InvalidateDeviceLookup()
 
     if deviceType == "LIGHT" or deviceType == "SWITCH" or deviceType == "OUTLET" then
         -- For lights/switches/outlets, state variables are on the proxy
@@ -1274,11 +1539,20 @@ function SubscribeToDevice(deviceID, deviceType)
             C4:RegisterVariableListener(proxyID, varID)
         end
 
-        -- Light V2 color lights: their current color and capabilities too
-        if deviceType == "LIGHT" and GetLightColorCaps(proxyID) then
+        -- Light V2 lights: their current color and capabilities (1200, 1201, 1202, 6661) and the
+        -- Default On preset (1006), whatever the capabilities say now. At start-up a light driver
+        -- may not have reported its capabilities yet (6661 empty), and a light that gains color
+        -- later must not need a restart of this driver to be followed.
+        if deviceType == "LIGHT" and IsLightV2(proxyID) then
             for _, varID in ipairs(LIGHT_V2_COLOR_VARIABLES) do
                 C4:RegisterVariableListener(proxyID, varID)
             end
+            C4:RegisterVariableListener(proxyID, VARIABLE_IDS.V2_PRESET_LEVEL)
+        end
+
+        -- Light V2 lights whose driver announces settings changes (see SETTINGS_CHANGED_VAR)
+        if deviceType == "LIGHT" or deviceType == "SWITCH" then
+            ResolveSettingsChangedVariable(deviceID)
         end
 
         -- Also register for LED color variables on the device itself (if LED control enabled)
@@ -1333,6 +1607,7 @@ end
 -- Unsubscribe from device variable changes
 function UnsubscribeFromDevice(deviceID, deviceType)
     local config = DEVICE_TYPES[deviceType]
+    InvalidateDeviceLookup()
 
     if deviceType == "LIGHT" or deviceType == "SWITCH" or deviceType == "OUTLET" then
         -- For lights/switches/outlets, unregister from proxy variables
@@ -1341,10 +1616,16 @@ function UnsubscribeFromDevice(deviceID, deviceType)
             C4:UnregisterVariableListener(proxyID, varID)
         end
 
-        if deviceType == "LIGHT" and GetLightColorCaps(proxyID) then
+        if deviceType == "LIGHT" and IsLightV2(proxyID) then
             for _, varID in ipairs(LIGHT_V2_COLOR_VARIABLES) do
                 C4:UnregisterVariableListener(proxyID, varID)
             end
+            C4:UnregisterVariableListener(proxyID, VARIABLE_IDS.V2_PRESET_LEVEL)
+        end
+
+        if gSettingsChangedVars[deviceID] then
+            C4:UnregisterVariableListener(deviceID, gSettingsChangedVars[deviceID])
+            gSettingsChangedVars[deviceID] = nil
         end
 
         -- Also unregister LED variables from device (only for lights and switches, not outlets)
@@ -1818,13 +2099,8 @@ end
 -- button LED color texts and its advanced dimmer control numbers. An empty retained config removes
 -- an entity, and is harmless for one that was never published.
 function RemoveLightEntities(deviceID)
-    PublishMQTT("homeassistant/light/control4_" .. deviceID .. "/config", "", 1, true)
-    for _, suffix in ipairs({"top_on", "top_off", "bottom_on", "bottom_off"}) do
-        PublishMQTT("homeassistant/text/control4_" .. deviceID .. "_" .. suffix .. "/config", "", 1, true)
-    end
-    for _, suffix in ipairs({"min_on_level", "max_on_level", "preset_level", "click_ramp_rate_up",
-                             "click_ramp_rate_down", "hold_ramp_rate_up", "hold_ramp_rate_down"}) do
-        PublishMQTT("homeassistant/number/control4_" .. deviceID .. "_" .. suffix .. "/config", "", 1, true)
+    for _, topic in ipairs(DeviceConfigTopics("LIGHT", deviceID)) do
+        PublishMQTT(topic, "", 1, true)
     end
 end
 
@@ -2247,10 +2523,7 @@ function RemoveMediaRoomFromMonitor(roomID)
     UnsubscribeFromMediaRoom(roomID)
 
     -- Cancel any pending debounce timer
-    local existingTimer = gMediaRoomDebounceTimers[roomID]
-    if existingTimer and type(existingTimer) == "number" then
-        C4:KillTimer(existingTimer)
-    end
+    CancelTimerObject(gMediaRoomDebounceTimers[roomID])
     gMediaRoomDebounceTimers[roomID] = nil
 
     -- Remove from Home Assistant by publishing empty discovery
@@ -2308,6 +2581,20 @@ function ParseHVACState(c4State)
     end
 end
 
+-- A number cut to an integer toward zero, as string.format("%d", x) does with a fractional x on
+-- Lua 5.1 (72.6 -> 72, -3.5 -> -3). Lua 5.3 and later raise an error for "%d" with a fractional
+-- number instead, so values that may be fractional go through this first.
+function TruncInt(x)
+    x = tonumber(x) or 0
+    if x ~= x or x == math.huge or x == -math.huge then
+        return 0
+    end
+    if x >= 0 then
+        return math.floor(x)
+    end
+    return math.ceil(x)
+end
+
 function PublishThermostatState(thermostatID)
     -- thermostatID is device ID (consistent with lights/switches)
     -- Use proxy ID for reading variables and getting display name
@@ -2354,7 +2641,7 @@ function PublishThermostatState(thermostatID)
   "fan_mode": "%s",
   "action": "%s",
   "humidity": %d
-}]], currentTemp, coolSetpoint, heatSetpoint, haMode, haFanMode, haAction, humidity)
+}]], TruncInt(currentTemp), TruncInt(coolSetpoint), TruncInt(heatSetpoint), haMode, haFanMode, haAction, TruncInt(humidity))
     else
         -- Heat/Cool/Off modes: show single setpoint, hide dual setpoints
         local temperature = heatSetpoint
@@ -2370,7 +2657,7 @@ function PublishThermostatState(thermostatID)
   "fan_mode": "%s",
   "action": "%s",
   "humidity": %d
-}]], currentTemp, temperature, haMode, haFanMode, haAction, humidity)
+}]], TruncInt(currentTemp), TruncInt(temperature), haMode, haFanMode, haAction, TruncInt(humidity))
     end
 
     local topic = "homeassistant/climate/control4_" .. thermostatID .. "/state"
@@ -2456,6 +2743,7 @@ function PublishThermostatDiscovery(thermostatID)
      stateTopic, stateTopic, stateTopic, stateTopic,
      modeCommandTopic, fanModeCommandTopic,
      uniqueID, EscapeJSON(deviceName))
+    discoveryPayload = WithAvailability(discoveryPayload)
 
     Log("Publishing thermostat auto-discovery for: " .. thermostatName)
     Log("  Config Topic: " .. configTopic)
@@ -2511,6 +2799,7 @@ function PublishThermostatButtonLEDDiscovery(thermostatID)
             model = "Thermostat V2"
         }
     }
+    AddAvailability(config)
 
     local payload = EncodeJSON(config)
     Log("Publishing thermostat button LED discovery: " .. thermostatName)
@@ -2599,19 +2888,20 @@ end
 -- Debounced Media Room State Publishing
 -- Delays publishing until volume/state changes have settled (300ms)
 function PublishMediaRoomStateDebounced(roomID)
-    -- Cancel any existing timer for this room
-    local existingTimer = gMediaRoomDebounceTimers[roomID]
-    if existingTimer and type(existingTimer) == "number" then
-        C4:KillTimer(existingTimer)
-    end
+    -- Cancel any existing timer for this room (SafeSetTimer returns a timer object)
+    CancelTimerObject(gMediaRoomDebounceTimers[roomID])
 
     -- Create a new timer to publish after 300ms (non-repeating)
-    gMediaRoomDebounceTimers[roomID] = SafeSetTimer(300, function(timer)
-        gMediaRoomDebounceTimers[roomID] = nil
+    local newTimer
+    newTimer = SafeSetTimer(300, function(timer)
+        if gMediaRoomDebounceTimers[roomID] == newTimer then
+            gMediaRoomDebounceTimers[roomID] = nil
+        end
         if gMQTTConnected then
             PublishMediaRoomState(roomID)
         end
     end, false)  -- false = non-repeating
+    gMediaRoomDebounceTimers[roomID] = newTimer
 end
 
 -- Media Room Auto-Discovery
@@ -2632,6 +2922,9 @@ function PublishMediaRoomDiscovery(roomID)
 
     -- Build discovery payload for Home Assistant MQTT media player
     -- Note: MQTT media_player has limited discovery support, so we keep it minimal
+    -- Availability: the mqtt_media_player custom component reads one availability_topic, so that is
+    -- the bridge's (the room's own topic only ever says "online"). The "availability" list (bridge
+    -- and room, both must be online) is there for a player that reads the standard form.
     local discoveryPayload = string.format([[{
   "name": "%s",
   "object_id": "%s",
@@ -2639,13 +2932,18 @@ function PublishMediaRoomDiscovery(roomID)
   "state_topic": "%s",
   "command_topic": "%s",
   "availability_topic": "%s",
+  "payload_available": "online",
+  "payload_not_available": "offline",
+  "availability": [{"topic": "%s"}, {"topic": "%s"}],
+  "availability_mode": "all",
   "device": {
     "identifiers": ["%s"],
     "name": "%s",
     "manufacturer": "Control4",
     "model": "Media Room"
   }
-}]], EscapeJSON(deviceName), objectID, uniqueID, stateTopic, commandTopic, availabilityTopic, uniqueID, EscapeJSON(deviceName))
+}]], EscapeJSON(deviceName), objectID, uniqueID, stateTopic, commandTopic, BRIDGE_STATUS_TOPIC,
+     BRIDGE_STATUS_TOPIC, availabilityTopic, uniqueID, EscapeJSON(deviceName))
 
     Log("Publishing media room auto-discovery for: " .. roomName)
     Log("  Config Topic: " .. configTopic)
@@ -2717,7 +3015,7 @@ function PublishContactSensorDiscovery(deviceID)
   "device": %s
 }]], EscapeJSON(stateEntity.name), stateEntity.id, DefaultEntityID("binary_sensor", stateEntity.id, deviceID), uniqueID, stateTopic, devicePayload)
 
-        PublishMQTT(configTopic, discoveryPayload, 1, true)
+        PublishMQTT(configTopic, WithAvailability(discoveryPayload), 1, true)
         Log("  Published binary_sensor discovery: " .. stateEntity.name)
     end
 
@@ -2737,7 +3035,7 @@ function PublishContactSensorDiscovery(deviceID)
   "device": %s
 }]], EscapeJSON(entities.battery.name), entities.battery.id, DefaultEntityID("sensor", entities.battery.id, deviceID), deviceID, batteryStateTopic, devicePayload)
 
-        PublishMQTT(batteryConfigTopic, batteryPayload, 1, true)
+        PublishMQTT(batteryConfigTopic, WithAvailability(batteryPayload), 1, true)
         Log("  Published battery sensor discovery")
     end
 
@@ -2757,7 +3055,7 @@ function PublishContactSensorDiscovery(deviceID)
   "device": %s
 }]], EscapeJSON(entities.voltage.name), entities.voltage.id, DefaultEntityID("sensor", entities.voltage.id, deviceID), deviceID, voltageStateTopic, devicePayload)
 
-        PublishMQTT(voltageConfigTopic, voltagePayload, 1, true)
+        PublishMQTT(voltageConfigTopic, WithAvailability(voltagePayload), 1, true)
         Log("  Published battery voltage sensor discovery")
     end
 
@@ -2777,7 +3075,7 @@ function PublishContactSensorDiscovery(deviceID)
   "device": %s
 }]], EscapeJSON(entities.temperature.name), entities.temperature.id, DefaultEntityID("sensor", entities.temperature.id, deviceID), deviceID, tempStateTopic, devicePayload)
 
-        PublishMQTT(tempConfigTopic, tempPayload, 1, true)
+        PublishMQTT(tempConfigTopic, WithAvailability(tempPayload), 1, true)
         Log("  Published temperature sensor discovery")
     end
 
@@ -2843,7 +3141,27 @@ function PublishContactSensorState(deviceID)
     return true
 end
 
+-- A watched change is published at once, in the same callback (no timer, no window). Several
+-- variables of one light change together (level, state, color): each publishes, but a payload
+-- identical to the last one sent on that topic is skipped.
+function RunSkippingUnchanged(fn)
+    gSkipUnchanged = true
+    local ok, err = pcall(fn)
+    gSkipUnchanged = false
+    if not ok then
+        LogError("State publish failed: " .. tostring(err))
+    end
+end
+
+-- Controller callbacks are protected: an error in one change must not stop the next
 function OnWatchedVariableChanged(idDevice, idVariable, strValue)
+    local ok, err = pcall(HandleWatchedVariableChanged, idDevice, idVariable, strValue)
+    if not ok then
+        LogError("OnWatchedVariableChanged(" .. tostring(idDevice) .. ", " .. tostring(idVariable) .. "): " .. tostring(err))
+    end
+end
+
+function HandleWatchedVariableChanged(idDevice, idVariable, strValue)
     -- Note: idDevice can be either a device ID or proxy ID depending on which variable changed
     -- - For light/switch state variables (LIGHT_LEVEL, SWITCH_STATE): idDevice is the PROXY ID
     -- - For LED color variables: idDevice is the DEVICE ID
@@ -2851,33 +3169,24 @@ function OnWatchedVariableChanged(idDevice, idVariable, strValue)
     -- - For thermostat LED color variable: idDevice is the DEVICE ID
     -- - For media rooms: idDevice is the same for both device and proxy
 
+    -- A light driver's SETTINGS_CHANGED: checked first, because the controller numbers a driver's
+    -- own variables from 1001, the same IDs as the light proxy variables below
+    local changedDevice = tonumber(idDevice)
+    if changedDevice and gSettingsChangedVars[changedDevice] == tonumber(idVariable) then
+        PublishLightV2SettingsChanged(changedDevice)
+        return
+    end
+
     -- Determine the actual device ID we store in our lists
     local actualDeviceID = idDevice
     local deviceName = C4:GetDeviceDisplayName(idDevice) or "Unknown"
 
     -- Check what type of variable this is and find the device ID accordingly
+    local lookup = GetDeviceLookup()
     if LIGHT_PROXY_VARIABLES[idVariable] then
         -- State variables and advanced control variables come from proxy ID - need to find device ID
-        -- For lights/fans, we need to check if this proxy corresponds to a monitored device
-        -- Build a reverse map: check if any monitored device has this as its proxy
-        for _, deviceID in ipairs(gMonitoredLights) do
-            if GetProxyID(deviceID) == idDevice then
-                actualDeviceID = deviceID
-                break
-            end
-        end
-        for _, deviceID in ipairs(gMonitoredSwitches) do
-            if GetProxyID(deviceID) == idDevice then
-                actualDeviceID = deviceID
-                break
-            end
-        end
-        for _, deviceID in ipairs(gMonitoredOutlets) do
-            if GetProxyID(deviceID) == idDevice then
-                actualDeviceID = deviceID
-                break
-            end
-        end
+        -- (proxy -> monitored light, switch or outlet, built once: see GetDeviceLookup)
+        actualDeviceID = lookup.lightProxy[changedDevice] or idDevice
     elseif idVariable == VARIABLE_IDS.TEMPERATURE_F or
            idVariable == VARIABLE_IDS.HEAT_SETPOINT_F or
            idVariable == VARIABLE_IDS.COOL_SETPOINT_F or
@@ -2886,47 +3195,50 @@ function OnWatchedVariableChanged(idDevice, idVariable, strValue)
            idVariable == VARIABLE_IDS.HVAC_STATE or
            idVariable == VARIABLE_IDS.HUMIDITY then
         -- Thermostat state variables come from proxy ID - need to find device ID
-        for _, deviceID in ipairs(gMonitoredThermostats) do
-            if GetProxyID(deviceID) == idDevice then
-                actualDeviceID = deviceID
-                break
-            end
-        end
+        actualDeviceID = lookup.thermostatProxy[changedDevice] or idDevice
     end
 
     -- Now check if actualDeviceID is monitored
-    local isLight = IsDeviceMonitored(actualDeviceID, "LIGHT")
-    local isSwitch = IsDeviceMonitored(actualDeviceID, "SWITCH")
-    local isOutlet = IsDeviceMonitored(actualDeviceID, "OUTLET")
-    local isThermostat = IsDeviceMonitored(actualDeviceID, "THERMOSTAT")
-    local isMediaRoom = IsDeviceMonitored(actualDeviceID, "MEDIA_ROOM")
-    local isContactSensor = IsDeviceMonitored(actualDeviceID, "CONTACT_SENSOR")
+    local actualID = tonumber(actualDeviceID)
+    local isLight = actualID ~= nil and lookup.sets.LIGHT[actualID] == true
+    local isSwitch = actualID ~= nil and lookup.sets.SWITCH[actualID] == true
+    local isOutlet = actualID ~= nil and lookup.sets.OUTLET[actualID] == true
+    local isThermostat = actualID ~= nil and lookup.sets.THERMOSTAT[actualID] == true
+    local isMediaRoom = actualID ~= nil and lookup.sets.MEDIA_ROOM[actualID] == true
+    local isContactSensor = actualID ~= nil and lookup.sets.CONTACT_SENSOR[actualID] == true
 
     if not isLight and not isSwitch and not isOutlet and not isThermostat and not isMediaRoom and not isContactSensor then
         return  -- Not monitoring this device
     end
 
-    -- Handle light variables (Light V2 color lights also report their color)
+    -- Handle light variables (Light V2 color lights also report their color). Several of these
+    -- change together for one light: each is published at once; repeated payloads are skipped.
     if isLight and (idVariable == VARIABLE_IDS.LIGHT_LEVEL or idVariable == VARIABLE_IDS.SWITCH_STATE or
                     idVariable == VARIABLE_IDS.CURRENT_CHROMATICITY or idVariable == VARIABLE_IDS.CURRENT_COLOR_MODE or
                     idVariable == VARIABLE_IDS.CURRENT_CCT) then
         if gMQTTConnected then
-            PublishLightState(actualDeviceID)
+            RunSkippingUnchanged(function() PublishLightState(actualDeviceID) end)
         end
         local timestamp = os.date("%H:%M:%S")
         C4:UpdateProperty("Last Event", deviceName .. " @ " .. timestamp)
 
-    -- Light V2 capabilities changed (color support, color temperature range): update the entity
+    -- Light V2 capabilities changed (color support, color temperature range): update the entity if
+    -- what its discovery config is built from changed, and look again for SETTINGS_CHANGED (a light
+    -- driver that has just started reports its capabilities then)
     elseif isLight and idVariable == VARIABLE_IDS.DYNAMIC_CAPABILITIES then
+        ResolveSettingsChangedVariable(actualDeviceID)
         if gMQTTConnected then
-            PublishLightDiscovery(actualDeviceID)
-            PublishLightState(actualDeviceID)
+            local proxyID = GetProxyID(actualDeviceID)
+            if gLightColorCapsSig[actualID] ~= LightDiscoverySignature(proxyID) then
+                PublishLightDiscovery(actualDeviceID)
+            end
+            RunSkippingUnchanged(function() PublishLightState(actualDeviceID) end)
         end
 
     -- Handle switch variables
     elseif isSwitch and idVariable == VARIABLE_IDS.SWITCH_STATE then
         if gMQTTConnected then
-            PublishSwitchState(actualDeviceID)
+            RunSkippingUnchanged(function() PublishSwitchState(actualDeviceID) end)
         end
         local timestamp = os.date("%H:%M:%S")
         C4:UpdateProperty("Last Event", deviceName .. " @ " .. timestamp)
@@ -2934,7 +3246,7 @@ function OnWatchedVariableChanged(idDevice, idVariable, strValue)
     -- Handle outlet variables
     elseif isOutlet and idVariable == VARIABLE_IDS.SWITCH_STATE then
         if gMQTTConnected then
-            PublishOutletState(actualDeviceID)
+            RunSkippingUnchanged(function() PublishOutletState(actualDeviceID) end)
         end
         local timestamp = os.date("%H:%M:%S")
         C4:UpdateProperty("Last Event", deviceName .. " @ " .. timestamp)
@@ -3053,6 +3365,13 @@ end
 -- Handle device events from media rooms (play, pause, stop, etc.)
 -- This allows us to track accurate playback state
 function OnDeviceEvent(idDevice, eventId)
+    local ok, err = pcall(HandleDeviceEvent, idDevice, eventId)
+    if not ok then
+        LogError("OnDeviceEvent(" .. tostring(idDevice) .. ", " .. tostring(eventId) .. "): " .. tostring(err))
+    end
+end
+
+function HandleDeviceEvent(idDevice, eventId)
     -- Check if this is a monitored media room
     if not IsDeviceMonitored(idDevice, "MEDIA_ROOM") then
         return  -- Not a monitored media room
@@ -3116,6 +3435,13 @@ end
 
 -- ReceivedFromProxy: Called when a bound contact sensor changes state
 function ReceivedFromProxy(idBinding, strCommand, tParams)
+    local ok, err = pcall(HandleReceivedFromProxy, idBinding, strCommand, tParams)
+    if not ok then
+        LogError("ReceivedFromProxy(" .. tostring(idBinding) .. ", " .. tostring(strCommand) .. "): " .. tostring(err))
+    end
+end
+
+function HandleReceivedFromProxy(idBinding, strCommand, tParams)
     Log("========================================")
     Log("ReceivedFromProxy CALLED!")
     Log("  Binding ID: " .. tostring(idBinding))
@@ -3192,10 +3518,25 @@ function PublishLightState(lightID)
     local lightName = C4:GetDeviceDisplayName(proxyID)
 
     if not lightName then
-        LogError("Light " .. lightID .. " not found - may have been deleted")
-        RemoveDeletedDevice(lightID)
+        -- A name that can't be read once (a project still loading, a driver restarting) is no
+        -- reason to drop the light: only 3 misses at least a minute apart count as deleted. The
+        -- Cleanup Deleted Devices action removes at once.
+        local id = tonumber(lightID)
+        local now = os.time()
+        local miss = gLightMisses[id] or {count = 0, last = nil}
+        if not miss.last or now - miss.last >= TIMER_INTERVALS.DELETED_MISS_SPACING then
+            miss.count = miss.count + 1
+            miss.last = now
+        end
+        gLightMisses[id] = miss
+        LogError("Light " .. lightID .. " not found - may have been deleted (miss " .. miss.count .. " of 3)")
+        if miss.count >= 3 then
+            gLightMisses[id] = nil
+            RemoveDeletedDevice(lightID)
+        end
         return false
     end
+    gLightMisses[tonumber(lightID)] = nil
 
     local level = C4:GetDeviceVariable(proxyID, VARIABLE_IDS.LIGHT_LEVEL)
     local brightness = 0
@@ -3306,6 +3647,21 @@ function DefaultEntityID(domain, objectID, deviceID)
     return domain .. "." .. objectID
 end
 
+-- Every entity is unavailable in Home Assistant while the bridge is offline (BRIDGE_STATUS_TOPIC)
+function AddAvailability(config)
+    config.availability_topic = BRIDGE_STATUS_TOPIC
+    config.payload_available = "online"
+    config.payload_not_available = "offline"
+    return config
+end
+
+-- The same for a discovery payload built as JSON text: added at the start of the object
+local AVAILABILITY_JSON = '\n  "availability_topic": "' .. BRIDGE_STATUS_TOPIC .. '",' ..
+    '\n  "payload_available": "online",\n  "payload_not_available": "offline",'
+function WithAvailability(json)
+    return (string.gsub(json, "^(%s*){", "%1{" .. AVAILABILITY_JSON, 1))
+end
+
 -- Home Assistant Auto-Discovery
 function PublishLightDiscovery(lightID)
     -- lightID is the device ID - get proxy ID for reading variables and display name
@@ -3364,13 +3720,25 @@ function PublishLightDiscovery(lightID)
         config.max_kelvin = caps.maxK
     end
     
-    local payload = EncodeJSON(config)
+    local payload = EncodeJSON(AddAvailability(config))
 
     Log("Publishing auto-discovery for: " .. lightName)
     Log("  Topic: " .. discoveryTopic)
 
+    -- What this config was built from: a capabilities change republishes it only if this changes
+    gLightColorCapsSig[tonumber(lightID)] = LightDiscoverySignature(proxyID)
+
     -- Use QoS 1 for reliable discovery message delivery
     return PublishMQTT(discoveryTopic, payload, 1, true)
+end
+
+-- What a light's discovery config depends on: dimmer or not, and its color capabilities
+function LightDiscoverySignature(proxyID)
+    local level = C4:GetDeviceVariable(proxyID, VARIABLE_IDS.LIGHT_LEVEL)
+    if not (level and level ~= "") then
+        return "switch"
+    end
+    return "dimmer:" .. ColorCapsSignature(proxyID)
 end
 
 -- Switch State Publishing
@@ -3430,7 +3798,7 @@ function PublishSwitchDiscovery(switchID)
         }
     }
 
-    local payload = EncodeJSON(config)
+    local payload = EncodeJSON(AddAvailability(config))
     Log("Publishing switch discovery: " .. switchName)
 
     return PublishMQTT(discoveryTopic, payload, 1, true)
@@ -3493,7 +3861,7 @@ function PublishOutletDiscovery(outletID)
         }
     }
 
-    local payload = EncodeJSON(config)
+    local payload = EncodeJSON(AddAvailability(config))
     Log("Publishing outlet discovery: " .. outletName)
 
     return PublishMQTT(discoveryTopic, payload, 1, true)
@@ -3516,6 +3884,9 @@ function PublishLEDDiscovery(deviceID, deviceType)
     local proxyID = GetProxyID(deviceID)
     if IsLightV2(proxyID) then
         local settings = RefreshLightV2Settings(proxyID)
+        if gSettingsCacheOnly and not settings then
+            return  -- not read yet (automatic run): leave its LED entities as they are
+        end
         if not (settings and settings.leds[0] and settings.leds[1]) then
             for _, suffix in ipairs({"top_on", "top_off", "bottom_on", "bottom_off"}) do
                 PublishMQTT("homeassistant/text/control4_" .. deviceID .. "_" .. suffix .. "/config", "", 1, true)
@@ -3580,7 +3951,7 @@ function PublishLEDDiscovery(deviceID, deviceType)
             }
         }
 
-        local payload = EncodeJSON(config)
+        local payload = EncodeJSON(AddAvailability(config))
         Log("  Publishing LED text entity: " .. ledConfig.name .. " -> " .. discoveryTopic)
         PublishMQTT(discoveryTopic, payload, 1, true)
     end
@@ -3742,7 +4113,9 @@ function PublishDimmerAdvancedControlDiscovery(deviceID)
     -- A Light V2 light has only the settings its proxy reports (a Hue light has no hold rates or
     -- min/max): remove any entity published for the others before. Its limits come from the proxy.
     if IsLightV2(proxyID) then
-        RefreshLightV2Settings(proxyID)
+        if not RefreshLightV2Settings(proxyID) and gSettingsCacheOnly then
+            return false  -- not read yet (automatic run): leave its setting entities as they are
+        end
         local available = {}
         for _, control in ipairs(controls) do
             if GetDimmerControlValue(deviceID, proxyID, control.suffix) then
@@ -3782,7 +4155,7 @@ function PublishDimmerAdvancedControlDiscovery(deviceID)
             }
         }
 
-        local payload = EncodeJSON(config)
+        local payload = EncodeJSON(AddAvailability(config))
         PublishMQTT(discoveryTopic, payload, 1, true)
     end
 
@@ -3838,14 +4211,28 @@ function PublishDimmerAdvancedControlStates(deviceID)
     return true
 end
 
-function PublishAllDiscovery()
+-- Paced discovery for every monitored device (one device per DISCOVERY_DELAY). auto: run by the
+-- driver itself (on connect, or Home Assistant restarting) rather than the Publish Auto-Discovery
+-- action. onComplete: called when the run has gone through every device.
+function PublishAllDiscovery(auto, onComplete)
     if not gMQTTConnected then
         LogError("Cannot publish discovery - not connected to MQTT")
         return
     end
 
+    gDiscoveryInProgress = true
     Log("========================================")
     Log("Publishing auto-discovery for all devices...")
+
+    -- One device's publishing: from cached Light V2 settings in an automatic run, with a full
+    -- read of the light (as before) from the action
+    local function runStep(fn)
+        if auto then
+            RunWithCachedSettings(fn)
+        else
+            fn()
+        end
+    end
 
     -- Forward declarations for mutual recursion
     local PublishNextLight
@@ -3860,18 +4247,21 @@ function PublishAllDiscovery()
     PublishNextLight = function()
         if lightIndex <= #gMonitoredLights then
             local lightID = gMonitoredLights[lightIndex]
-            PublishLightDiscovery(lightID)
+            -- An automatic run uses cached Light V2 settings only (no blocking proxy reads)
+            runStep(function()
+                PublishLightDiscovery(lightID)
 
-            -- Also publish LED discovery and state if enabled
-            if IsLEDControlEnabled() then
-                PublishLEDDiscovery(lightID, "LIGHT")
-                PublishAllLEDStates(lightID)
-            end
+                -- Also publish LED discovery and state if enabled
+                if IsLEDControlEnabled() then
+                    PublishLEDDiscovery(lightID, "LIGHT")
+                    PublishAllLEDStates(lightID)
+                end
 
-            -- Publish advanced dimmer control discovery and state if enabled
-            if IsAdvancedDimmerControlEnabled() then
-                PublishDimmerAdvancedControlDiscovery(lightID)
-            end
+                -- Publish advanced dimmer control discovery and state if enabled
+                if IsAdvancedDimmerControlEnabled() then
+                    PublishDimmerAdvancedControlDiscovery(lightID)
+                end
+            end)
 
             lightIndex = lightIndex + 1
             -- Delay to prevent overwhelming the socket
@@ -3890,13 +4280,15 @@ function PublishAllDiscovery()
     PublishNextSwitch = function()
         if switchIndex <= #gMonitoredSwitches then
             local switchID = gMonitoredSwitches[switchIndex]
-            PublishSwitchDiscovery(switchID)
+            runStep(function()
+                PublishSwitchDiscovery(switchID)
 
-            -- Also publish LED discovery and state if enabled
-            if IsLEDControlEnabled() then
-                PublishLEDDiscovery(switchID, "SWITCH")
-                PublishAllLEDStates(switchID)
-            end
+                -- Also publish LED discovery and state if enabled
+                if IsLEDControlEnabled() then
+                    PublishLEDDiscovery(switchID, "SWITCH")
+                    PublishAllLEDStates(switchID)
+                end
+            end)
 
             switchIndex = switchIndex + 1
             -- Delay to prevent overwhelming the socket
@@ -3950,7 +4342,17 @@ function PublishAllDiscovery()
     local mediaRoomIndex = 1
     PublishNextMediaRoom = function()
         if mediaRoomIndex <= #gMonitoredMediaRooms then
-            PublishMediaRoomDiscovery(gMonitoredMediaRooms[mediaRoomIndex])
+            local roomID = gMonitoredMediaRooms[mediaRoomIndex]
+            if auto then
+                -- The mqtt_media_player custom component adds an entity for every config it
+                -- receives (a second one is refused with an error in Home Assistant's log), and
+                -- its retained config already reaches it when Home Assistant restarts: only the
+                -- room's availability and state here
+                PublishMQTT("homeassistant/media_player/control4_room_" .. roomID .. "/availability", "online", 1, true)
+                PublishMediaRoomState(roomID)
+            else
+                PublishMediaRoomDiscovery(roomID)
+            end
             mediaRoomIndex = mediaRoomIndex + 1
             -- Delay to prevent overwhelming the socket
             SafeSetTimer(TIMER_INTERVALS.DISCOVERY_DELAY, function()
@@ -3976,12 +4378,71 @@ function PublishAllDiscovery()
         else
             Log("Auto-discovery complete for " .. #gMonitoredContactSensors .. " contact sensors")
             Log("========================================")
+            gDiscoveryInProgress = false
+            if onComplete then
+                onComplete()
+            end
         end
     end
 
     -- Each step moves on to the next one when it has nothing to do
     PublishNextLight()
 end
+
+-- Every discovery config topic one monitored device can have published (an empty retained config
+-- removes an entity, and is harmless for one never published)
+function DeviceConfigTopics(deviceType, deviceID)
+    local topics = {}
+    local function add(topic) table.insert(topics, topic) end
+    local function addLEDTexts()
+        for _, suffix in ipairs({"top_on", "top_off", "bottom_on", "bottom_off"}) do
+            add("homeassistant/text/control4_" .. deviceID .. "_" .. suffix .. "/config")
+        end
+    end
+    if deviceType == "LIGHT" then
+        add("homeassistant/light/control4_" .. deviceID .. "/config")
+        addLEDTexts()
+        for _, suffix in ipairs({"min_on_level", "max_on_level", "preset_level", "click_ramp_rate_up",
+                                 "click_ramp_rate_down", "hold_ramp_rate_up", "hold_ramp_rate_down"}) do
+            add("homeassistant/number/control4_" .. deviceID .. "_" .. suffix .. "/config")
+        end
+    elseif deviceType == "SWITCH" then
+        add("homeassistant/switch/control4_" .. deviceID .. "/config")
+        addLEDTexts()
+    elseif deviceType == "OUTLET" then
+        add("homeassistant/switch/control4_" .. deviceID .. "/config")
+    elseif deviceType == "THERMOSTAT" then
+        add("homeassistant/climate/control4_" .. deviceID .. "/config")
+        add("homeassistant/text/control4_thermostat_" .. deviceID .. "_button_led/config")
+    elseif deviceType == "MEDIA_ROOM" then
+        add("homeassistant/media_player/control4_room_" .. deviceID .. "/config")
+    elseif deviceType == "CONTACT_SENSOR" then
+        -- Each contact's binary sensor, and the battery, voltage and temperature sensors
+        local deviceInfo = gContactSensorDevices[deviceID]
+        if deviceInfo then
+            for bindingID in pairs(deviceInfo.bindings or {}) do
+                local stateEntity = GetContactStateEntity(bindingID)
+                if stateEntity then
+                    add("homeassistant/binary_sensor/" .. stateEntity.id .. "/config")
+                end
+            end
+            local customName, nameSuffix = GetContactSensorNaming(deviceID)
+            if customName then
+                local entities = BuildContactSensorEntityNames(customName, nameSuffix)
+                for _, entity in ipairs({entities.battery, entities.voltage, entities.temperature}) do
+                    add("homeassistant/sensor/" .. entity.id .. "/config")
+                end
+            end
+        end
+    end
+    return topics
+end
+
+-- Monitored device types, in the order they are listed and removed
+TRACKED_TYPES = {
+    {"LIGHT", "light"}, {"SWITCH", "switch"}, {"OUTLET", "outlet"}, {"THERMOSTAT", "thermostat"},
+    {"MEDIA_ROOM", "media room"}, {"CONTACT_SENSOR", "contact sensor"}
+}
 
 function RemoveAllEntities()
     if not gMQTTConnected then
@@ -3992,32 +4453,13 @@ function RemoveAllEntities()
     Log("========================================")
     Log("Removing all entities from Home Assistant...")
 
-    -- Remove all lights
-    for _, lightID in ipairs(gMonitoredLights) do
-        local discoveryTopic = "homeassistant/light/control4_" .. lightID .. "/config"
-        PublishMQTT(discoveryTopic, "", 1, true)
-        Log("  Removed light " .. lightID)
-    end
-
-    -- Remove all switches
-    for _, switchID in ipairs(gMonitoredSwitches) do
-        local discoveryTopic = "homeassistant/switch/control4_" .. switchID .. "/config"
-        PublishMQTT(discoveryTopic, "", 1, true)
-        Log("  Removed switch " .. switchID)
-    end
-
-    -- Remove all outlets
-    for _, outletID in ipairs(gMonitoredOutlets) do
-        local discoveryTopic = "homeassistant/switch/control4_" .. outletID .. "/config"
-        PublishMQTT(discoveryTopic, "", 1, true)
-        Log("  Removed outlet " .. outletID)
-    end
-
-    -- Remove all thermostats
-    for _, thermostatID in ipairs(gMonitoredThermostats) do
-        local discoveryTopic = "homeassistant/climate/control4_" .. thermostatID .. "/config"
-        PublishMQTT(discoveryTopic, "", 1, true)
-        Log("  Removed thermostat " .. thermostatID)
+    for _, entry in ipairs(TRACKED_TYPES) do
+        for _, deviceID in ipairs(GetMonitoredList(entry[1])) do
+            for _, topic in ipairs(DeviceConfigTopics(entry[1], deviceID)) do
+                PublishMQTT(topic, "", 1, true)
+            end
+            Log("  Removed " .. entry[2] .. " " .. deviceID)
+        end
     end
 
     Log("All entities removed - wait 5 seconds then run 'Publish Auto-Discovery'")
@@ -4203,6 +4645,12 @@ function SendLightColor(proxyID, cmd, transitionMs)
 end
 
 function HandleMQTTCommand(topic, payload)
+    -- The command subscriptions are wildcards: other integrations' command topics under
+    -- homeassistant/ arrive too. Only this driver's (control4_ objects) are handled.
+    if not (string.find(topic, "^homeassistant/[^/]+/control4_") and string.find(topic, "/set$")) then
+        return
+    end
+
     -- Try to parse as light command (format: homeassistant/light/control4_<ID>/set)
     local lightIDStr = string.match(topic, "homeassistant/light/control4_(%d+)/set")
 
@@ -5060,6 +5508,261 @@ function CleanupDeletedDevices()
 end
 
 
+-- Devices deleted from the project ------------------------------------------------------------
+-- Composer's delete of an item raises the OnItemRemoved system event. The event is only a hint:
+-- its payload isn't relied on. 3 s after the last event every monitored device is checked against
+-- C4:GetDevices(); one that is missing there and has no display name is checked again 5 s later
+-- (a driver being updated keeps its ID and comes back), and only then removed: from Home
+-- Assistant (empty retained configs), its listeners, the saved list and the caches. Nothing here
+-- runs on the command or state paths. (OnProjectChanged is deliberately not watched: it fires on
+-- almost every Composer edit.)
+DELETE_CHECK_DEBOUNCE = 3000
+DELETE_CHECK_CONFIRM = 5000
+ON_ITEM_REMOVED_FALLBACK = 11 -- C4SystemEvents.OnItemRemoved, if the global is missing
+gDeleteCheckTimer = nil
+gDeleteConfirmTimer = nil
+gSystemEventRawLogged = false
+gTrackedNames = {} -- Last display name seen of each monitored device: [id] = name (for the log)
+gPendingConfigRemovals = {} -- Config topics to empty on the next connection: [topic] = true
+
+function OnItemRemovedEventID()
+    return (C4SystemEvents and C4SystemEvents.OnItemRemoved) or ON_ITEM_REMOVED_FALLBACK
+end
+
+function RegisterProjectEvents()
+    if not C4.RegisterSystemEvent then
+        Log("System events not available: deleted devices are only removed by 'Cleanup Deleted Devices'")
+        return
+    end
+    local eventID = OnItemRemovedEventID()
+    local ok, err = pcall(function() C4:RegisterSystemEvent(eventID, 0) end)
+    if ok then
+        Log("Watching system event OnItemRemoved (" .. tostring(eventID) .. ") for deleted devices")
+    else
+        LogError("RegisterSystemEvent OnItemRemoved failed: " .. tostring(err))
+    end
+end
+
+function UnregisterProjectEvents()
+    if C4.UnregisterSystemEvent then
+        pcall(function() C4:UnregisterSystemEvent(OnItemRemovedEventID(), 0) end)
+    end
+end
+
+function OnSystemEvent(event)
+    local ok, err = pcall(HandleSystemEvent, event)
+    if not ok then
+        LogError("OnSystemEvent: " .. tostring(err))
+    end
+end
+
+function HandleSystemEvent(event)
+    local raw = tostring(event)
+    -- The payload format isn't documented: show it (always in debug mode, once per load regardless)
+    local line = "System event (raw): " .. string.sub(raw, 1, 500)
+    if not gSystemEventRawLogged then
+        gSystemEventRawLogged = true
+        print(line)  -- shown even with Debug Mode off, once per driver load
+        C4:DebugLog(line)
+    elseif IsLoggingEnabled() then
+        Log(line)
+    end
+    local name = string.match(raw, 'name%s*=%s*"([^"]*)"') or "?"
+    local id = string.match(raw, '[%s<]itemid%s*=%s*"(%d+)"') or string.match(raw, '[%s<]devid%s*=%s*"(%d+)"')
+        or string.match(raw, '[%s<]id%s*=%s*"(%d+)"') or string.match(raw, "<itemid>(%d+)</itemid>")
+        or string.match(raw, "<devid>(%d+)</devid>") or string.match(raw, "<id>(%d+)</id>")
+    Log("System event " .. name .. (id and (": item " .. id) or "") .. " - checking monitored devices in 3 s")
+    ScheduleDeletedDeviceCheck()
+end
+
+-- One check 3 s after the last of a burst of events (deleting several devices raises several)
+function ScheduleDeletedDeviceCheck()
+    CancelTimerObject(gDeleteCheckTimer)
+    CancelTimerObject(gDeleteConfirmTimer)
+    gDeleteConfirmTimer = nil
+    gDeleteCheckTimer = SetUntrackedTimer(DELETE_CHECK_DEBOUNCE, function()
+        gDeleteCheckTimer = nil
+        local first = FindDeletedDevices()
+        if not first or #first == 0 then
+            return
+        end
+        Log(#first .. " monitored device(s) missing from the project - checking again in 5 s")
+        gDeleteConfirmTimer = SetUntrackedTimer(DELETE_CHECK_CONFIRM, function()
+            gDeleteConfirmTimer = nil
+            local again = FindDeletedDevices()
+            if not again then
+                return
+            end
+            local stillMissing = {}
+            for _, item in ipairs(again) do
+                stillMissing[item.deviceType .. ":" .. item.id] = true
+            end
+            for _, item in ipairs(first) do
+                if stillMissing[item.deviceType .. ":" .. item.id] then
+                    RemoveDeletedTrackedDevice(item.deviceType, item.id)
+                else
+                    Log("Device " .. item.id .. " is back in the project: kept")
+                end
+            end
+        end)
+    end)
+end
+
+-- Monitored devices that are gone from the project, as {deviceType, id}; nil when the project
+-- couldn't be read (never take everything as deleted on a failed lookup) or when the result
+-- looks wrong (more than half of the monitored devices gone at once)
+function FindDeletedDevices()
+    local ok, devices = pcall(function() return C4:GetDevices() end)
+    if not ok or type(devices) ~= "table" or next(devices) == nil then
+        LogError("Deleted device check: the project's device list couldn't be read - nothing removed")
+        return nil
+    end
+    local present = {}
+    for deviceID, info in pairs(devices) do
+        present[tonumber(deviceID) or deviceID] = true
+        if type(info) == "table" then
+            for proxyID in pairs(info.proxies or {}) do
+                present[tonumber(proxyID) or proxyID] = true
+            end
+        end
+    end
+
+    local deleted, total = {}, 0
+    for _, entry in ipairs(TRACKED_TYPES) do
+        for _, item in ipairs(GetMonitoredList(entry[1])) do
+            local id = tonumber(item)
+            if id then
+                total = total + 1
+                local name = C4:GetDeviceDisplayName(id)
+                if name then
+                    gTrackedNames[id] = name
+                elseif not present[id] then
+                    table.insert(deleted, {deviceType = entry[1], id = id})
+                end
+            end
+        end
+    end
+
+    -- A single deletion is always taken; several are refused when they are over half of everything
+    if #deleted > 1 and #deleted * 2 > total then
+        LogError("Deleted device check: " .. #deleted .. " of " .. total .. " monitored devices seem gone at once - " ..
+                 "probably the project is still loading, nothing removed. If they really were deleted, run 'Cleanup Deleted Devices'.")
+        return nil
+    end
+    return deleted
+end
+
+-- Empty a discovery config now, or on the next connection
+function ClearDiscoveryConfig(topic)
+    if gMQTTConnected then
+        PublishMQTT(topic, "", 1, true)
+        gPendingConfigRemovals[topic] = nil
+    else
+        gPendingConfigRemovals[topic] = true
+    end
+end
+
+function PublishPendingConfigRemovals()
+    for topic in pairs(gPendingConfigRemovals) do
+        PublishMQTT(topic, "", 1, true)
+    end
+    gPendingConfigRemovals = {}
+end
+
+-- Drop a contact sensor's entries from the binding map property, so it isn't loaded again
+function RemoveFromContactSensorBindingMap(deviceID)
+    local kept = {}
+    for entry in string.gmatch(Properties["Contact Sensor Binding Map"] or "", "([^,]+)") do
+        local entryDevice = tonumber(string.match(entry, "^%s*(%d+)%s*:"))
+        if entryDevice ~= deviceID then
+            table.insert(kept, (string.match(entry, "^%s*(.-)%s*$")))
+        end
+    end
+    local value = table.concat(kept, ",")
+    Properties["Contact Sensor Binding Map"] = value
+    C4:UpdateProperty("Contact Sensor Binding Map", value)
+end
+
+-- Take one monitored device that was deleted from the project out of everything
+function RemoveDeletedTrackedDevice(deviceType, deviceID)
+    local list = GetMonitoredList(deviceType)
+    local index
+    for i, item in ipairs(list) do
+        if tonumber(item) == deviceID then
+            index = i
+            break
+        end
+    end
+    if not index then
+        return false
+    end
+
+    -- Topics first: a contact sensor's entity names come from its bindings
+    local topics = DeviceConfigTopics(deviceType, deviceID)
+    local proxyID = nil
+    if deviceType == "LIGHT" or deviceType == "SWITCH" or deviceType == "OUTLET" then
+        proxyID = GetProxyID(deviceID)
+    end
+
+    if deviceType == "CONTACT_SENSOR" then
+        for _, varID in ipairs(DEVICE_TYPES.CONTACT_SENSOR.variable_ids) do
+            pcall(function() C4:UnregisterVariableListener(deviceID, varID) end)
+        end
+        local deviceInfo = gContactSensorDevices[deviceID]
+        for bindingID in pairs((deviceInfo and deviceInfo.bindings) or {}) do
+            gContactSensorBindings[bindingID] = nil
+            gContactSensorStates[bindingID] = nil
+        end
+        gContactSensorDevices[deviceID] = nil
+        RemoveFromContactSensorBindingMap(deviceID)
+    else
+        local ok, err = pcall(UnsubscribeFromDevice, deviceID, deviceType)
+        if not ok then
+            LogError("Unsubscribing deleted device " .. deviceID .. ": " .. tostring(err))
+        end
+    end
+    if deviceType == "MEDIA_ROOM" then
+        CancelTimerObject(gMediaRoomDebounceTimers[deviceID])
+        gMediaRoomDebounceTimers[deviceID] = nil
+        gMediaRoomPlaybackState[deviceID] = nil
+    end
+
+    table.remove(list, index)
+    SaveMonitoredDevices(deviceType)
+    UpdateDeviceCount(deviceType)
+    InvalidateDeviceLookup()
+
+    if proxyID then
+        gLightV2Settings[tonumber(proxyID)] = nil
+    end
+    gLightColorCapsSig[deviceID] = nil
+    gLightMisses[deviceID] = nil
+
+    for _, topic in ipairs(topics) do
+        ClearDiscoveryConfig(topic)
+    end
+
+    local name = gTrackedNames[deviceID] or "(name unknown)"
+    gTrackedNames[deviceID] = nil
+    Log("Device " .. deviceID .. " " .. name .. " deleted from project: removed from Home Assistant")
+    C4:UpdateProperty("Last Event", "Removed deleted " .. name .. " @ " .. os.date("%H:%M:%S"))
+    return true
+end
+
+-- Names of the monitored devices as they are now (a deleted one has none any more)
+function RememberTrackedNames()
+    for _, entry in ipairs(TRACKED_TYPES) do
+        for _, item in ipairs(GetMonitoredList(entry[1])) do
+            local id = tonumber(item)
+            local name = id and C4:GetDeviceDisplayName(id)
+            if name then
+                gTrackedNames[id] = name
+            end
+        end
+    end
+end
+
+
 -- MQTT Protocol Functions
 function EncodeMQTTLength(length)
     local encoded = ""
@@ -5092,97 +5795,124 @@ function DecodeMQTTLength(data, offset)
     return value, index
 end
 
+-- An MQTT UTF-8 string: two-byte length, then the bytes
+function MQTTString(s)
+    return string.char(math.floor(#s / 256), #s % 256) .. s
+end
+
+-- Packet identifiers for QoS 1 PUBLISH and SUBSCRIBE, from one counter (1-65535, never 0)
+function NextPacketID()
+    gPacketID = gPacketID + 1
+    if gPacketID > 65535 then
+        gPacketID = 1
+    end
+    return gPacketID
+end
+
+-- Client ID: unique per driver instance and the same across reconnects, so two bridges on one
+-- broker don't take each other's connection: "Control4_HA_<device ID>_<4 hex digits>", the digits
+-- chosen once and kept (at most 23 characters, the length every MQTT 3.1.1 broker accepts).
+function GetClientID()
+    local deviceID = tonumber(C4:GetDeviceID() or "") or 0
+    local suffix = C4:PersistGetValue("MQTTClientIDSuffix")
+    if type(suffix) ~= "string" or not string.match(suffix, "^%x%x%x%x$") then
+        math.randomseed(os.time() + deviceID)
+        suffix = string.format("%04x", math.random(0, 65535))
+        C4:PersistSetValue("MQTTClientIDSuffix", suffix)
+    end
+    return "Control4_HA_" .. string.format("%d", deviceID) .. "_" .. suffix
+end
+
 function BuildMQTTConnect()
     Log("Building MQTT CONNECT packet...")
-    
-    local clientID = "Control4_HA_" .. tostring(os.time())
+
+    local clientID = GetClientID()
     local username = Properties["MQTT Username"] or ""
     local password = Properties["MQTT Password"] or ""
-    
-    local fixedHeader = string.char(0x10)
-    local variableHeader = ""
-    variableHeader = variableHeader .. string.char(0x00, 0x04)
-    variableHeader = variableHeader .. "MQTT"
-    variableHeader = variableHeader .. string.char(0x04)
-    
-    local connectFlags = 0x02
+
+    local variableHeader = MQTTString("MQTT") .. string.char(0x04)  -- protocol level 4 = MQTT 3.1.1
+
+    -- Connect flags: clean session (0x02), Will (0x04) at QoS 1 (0x08) and retained (0x20), so the
+    -- broker publishes "offline" to BRIDGE_STATUS_TOPIC if the connection is lost. User name (0x80)
+    -- and password (0x40): MQTT 3.1.1 allows a password only with a user name.
+    local connectFlags = 0x02 + 0x04 + 0x08 + 0x20
     if username ~= "" then
         connectFlags = connectFlags + 0x80
         Log("  Username: " .. username)
+        if password ~= "" then
+            connectFlags = connectFlags + 0x40
+            Log("  Password: [SET]")
+        end
+    elseif password ~= "" then
+        LogError("MQTT Password is set without an MQTT Username: the password is not sent")
     end
-    if password ~= "" then
-        connectFlags = connectFlags + 0x40
-        Log("  Password: [SET]")
-    end
-    
+
     variableHeader = variableHeader .. string.char(connectFlags)
-    variableHeader = variableHeader .. string.char(0x00, 0x3C)
-    
-    local payload = string.char(math.floor(#clientID / 256), #clientID % 256) .. clientID
-    
+    variableHeader = variableHeader .. string.char(math.floor(MQTT_KEEPALIVE_SECONDS / 256), MQTT_KEEPALIVE_SECONDS % 256)
+
+    -- Payload order: client ID, Will topic, Will message, user name, password
+    local payload = MQTTString(clientID) .. MQTTString(BRIDGE_STATUS_TOPIC) .. MQTTString("offline")
     if username ~= "" then
-        payload = payload .. string.char(math.floor(#username / 256), #username % 256) .. username
+        payload = payload .. MQTTString(username)
+        if password ~= "" then
+            payload = payload .. MQTTString(password)
+        end
     end
-    
-    if password ~= "" then
-        payload = payload .. string.char(math.floor(#password / 256), #password % 256) .. password
-    end
-    
+
     local remainingLength = #variableHeader + #payload
-    local packet = fixedHeader .. EncodeMQTTLength(remainingLength) .. variableHeader .. payload
-    
+    local packet = string.char(0x10) .. EncodeMQTTLength(remainingLength) .. variableHeader .. payload
+
     Log("  Client ID: " .. clientID)
+    Log("  Will: " .. BRIDGE_STATUS_TOPIC .. " = offline (retained, QoS 1)")
     Log("  Packet size: " .. #packet .. " bytes")
-    
+
     return packet
 end
 
-function BuildMQTTSubscribe(topic, qos)
+-- One SUBSCRIBE for one topic filter or a list of them, all at the same QoS. Returns the packet and
+-- its packet ID.
+function BuildMQTTSubscribe(topics, qos)
+    if type(topics) == "string" then
+        topics = {topics}
+    end
     qos = qos or 0
-    
-    Log("Building MQTT SUBSCRIBE packet:")
-    Log("  Topic: " .. topic)
-    Log("  QoS: " .. qos)
-    
-    local fixedHeader = string.char(0x82) -- SUBSCRIBE with QoS 1
-    
-    gPacketID = gPacketID + 1
-    if gPacketID > 65535 then gPacketID = 1 end
-    
-    local variableHeader = string.char(math.floor(gPacketID / 256), gPacketID % 256)
-    
-    local payload = string.char(math.floor(#topic / 256), #topic % 256) .. topic .. string.char(qos)
-    
+
+    local packetID = NextPacketID()
+    local variableHeader = string.char(math.floor(packetID / 256), packetID % 256)
+
+    local payload = ""
+    for _, topic in ipairs(topics) do
+        Log("  Subscribing to: " .. topic .. " (QoS " .. qos .. ")")
+        payload = payload .. MQTTString(topic) .. string.char(qos)
+    end
+
     local remainingLength = #variableHeader + #payload
-    local packet = fixedHeader .. EncodeMQTTLength(remainingLength) .. variableHeader .. payload
-    
-    return packet
+    local packet = string.char(0x82) .. EncodeMQTTLength(remainingLength) .. variableHeader .. payload  -- SUBSCRIBE (flags 0010)
+
+    return packet, packetID
 end
 
 function BuildMQTTPublish(topic, message, qos, retain)
     qos = qos or 0
     retain = retain or false
-    
+
     local fixedHeader = 0x30
     if retain then
         fixedHeader = fixedHeader + 0x01
     end
     fixedHeader = fixedHeader + (qos * 2)
-    
-    local variableHeader = string.char(math.floor(#topic / 256), #topic % 256) .. topic
-    
+
+    local variableHeader = MQTTString(topic)
+
     if qos > 0 then
-        variableHeader = variableHeader .. string.char(math.floor(gPacketID / 256), gPacketID % 256)
-        gPacketID = gPacketID + 1
-        if gPacketID > 65535 then
-            gPacketID = 1
-        end
+        local packetID = NextPacketID()
+        variableHeader = variableHeader .. string.char(math.floor(packetID / 256), packetID % 256)
     end
-    
+
     local payload = message
     local remainingLength = #variableHeader + #payload
     local packet = string.char(fixedHeader) .. EncodeMQTTLength(remainingLength) .. variableHeader .. payload
-    
+
     return packet
 end
 
@@ -5197,22 +5927,26 @@ function BuildMQTTPingReq()
     return string.char(0xC0, 0x00)
 end
 
+-- Topic filters of SUBSCRIBEs not yet answered, by packet ID (to name a refused one)
+gPendingSubscribes = {}
+
 function ParseMQTTPacket(data)
     if #data < 2 then
         return nil
     end
-    
-    local messageType = math.floor(string.byte(data, 1) / 16)
+
+    local firstByte = string.byte(data, 1)
+    local messageType = math.floor(firstByte / 16)
     local remainingLength, offset = DecodeMQTTLength(data, 2)
-    
+
     if not remainingLength then
         return nil
     end
-    
+
     -- CONNACK (type 2)
-    if messageType == 2 and #data >= offset + 1 then
+    if messageType == MQTT_TYPES.CONNACK and #data >= offset + 1 then
         local returnCode = string.byte(data, offset + 1)
-        
+
         if returnCode == 0 then
             return "CONNACK_SUCCESS"
         else
@@ -5227,15 +5961,32 @@ function ParseMQTTPacket(data)
             return "CONNACK_FAILED"
         end
     end
-    
-    -- SUBACK (type 9)
-    if messageType == 9 then
-        Log("SUBACK received - subscribed successfully")
+
+    -- SUBACK (type 9): packet ID, then one return code per topic filter (0-2 granted QoS, 0x80 failure)
+    if messageType == MQTT_TYPES.SUBACK then
+        local packetID = (string.byte(data, offset) or 0) * 256 + (string.byte(data, offset + 1) or 0)
+        local topics = gPendingSubscribes[packetID] or {}
+        gPendingSubscribes[packetID] = nil
+        local refused = 0
+        for i = offset + 2, offset + remainingLength - 1 do
+            local code = string.byte(data, i)
+            local index = i - offset - 1
+            if code == 0x80 then
+                refused = refused + 1
+                LogError("Broker refused subscription to " .. tostring(topics[index] or ("filter " .. index)) ..
+                    " - commands from Home Assistant on it will not arrive (check the broker's ACL)")
+            elseif IsLoggingEnabled() then
+                Log("SUBACK: " .. tostring(topics[index] or ("filter " .. index)) .. " granted QoS " .. tostring(code))
+            end
+        end
+        if refused == 0 then
+            Log("SUBACK received - subscribed successfully")
+        end
         return "SUBACK"
     end
-    
+
     -- PUBLISH (type 3)
-    if messageType == 3 then
+    if messageType == MQTT_TYPES.PUBLISH then
         -- Check we have enough data for topic length
         if #data < offset + 2 then
             if IsLoggingEnabled() then
@@ -5260,8 +6011,9 @@ function ParseMQTTPacket(data)
         local topic = string.sub(data, offset, offset + topicLen - 1)
         offset = offset + topicLen
 
-        -- Get QoS from fixed header (bits 1-2, above the retain bit and below the DUP bit)
-        local qos = math.floor((string.byte(data, 1) % 8) / 2)
+        -- QoS from fixed header (bits 1-2, above the retain bit and below the DUP bit); retain = bit 0
+        local qos = math.floor((firstByte % 8) / 2)
+        local retained = (firstByte % 2) == 1
 
         -- If QoS > 0, extract packet ID (2 bytes)
         local packetID = nil
@@ -5273,39 +6025,143 @@ function ParseMQTTPacket(data)
         -- Rest is payload
         local payload = string.sub(data, offset)
 
-        -- Handle the command
-        HandleMQTTCommand(topic, payload)
-
-        -- Send PUBACK for QoS 1 messages
+        -- Acknowledge a QoS 1 message before handling it: the handler can't delay or (by failing)
+        -- prevent the acknowledgement, which would make the broker send the command again
         if qos == 1 and packetID then
-            local puback = BuildMQTTPubAck(packetID)
-            C4:SendToNetwork(MQTT_BINDING_ID, tonumber(Properties["MQTT Broker Port"]) or 1883, puback)
+            SendToBroker(BuildMQTTPubAck(packetID))
             if IsLoggingEnabled() then
                 Log("PUBACK sent for packet ID: " .. packetID)
             end
         end
 
+        -- A retained message on a command topic was left on the broker by some client; the broker
+        -- delivers it (retain flag set) when we subscribe. It is an old command, not a new one.
+        if retained and string.find(topic, "/set$") then
+            if not gRetainedSetLogged[topic] then
+                gRetainedSetLogged[topic] = true
+                LogError("Ignoring retained command on " .. topic ..
+                    " (clear it on the broker with an empty retained message)")
+            end
+            return "PUBLISH"
+        end
+
+        if topic == HA_STATUS_TOPIC then
+            HandleHomeAssistantStatus(payload, retained)
+            return "PUBLISH"
+        end
+
+        -- Handle the command
+        local ok, err = pcall(HandleMQTTCommand, topic, payload)
+        if not ok then
+            LogError("Command on " .. topic .. " failed: " .. tostring(err))
+        end
+
         return "PUBLISH"
     end
-    
+
     -- PUBACK (type 4)
-    if messageType == 4 then
+    if messageType == MQTT_TYPES.PUBACK then
         return "PUBACK"
     end
-    
+
     -- PINGRESP (type 13)
-    if messageType == 13 then
+    if messageType == MQTT_TYPES.PINGRESP then
         Log("PINGRESP received - connection alive")
         return "PINGRESP"
     end
-    
+
     return "UNKNOWN"
+end
+
+-- Home Assistant's birth message ("online" on homeassistant/status): Home Assistant has (re)started
+-- and forgotten entities whose discovery isn't retained, so send discovery again, then states.
+-- A retained birth message is delivered (retain flag set) only because we have just subscribed:
+-- that is not a restart, and discovery is being sent for the new connection anyway.
+function HandleHomeAssistantStatus(payload, retained)
+    if payload ~= "online" then
+        Log("Home Assistant status: " .. tostring(payload))
+        return
+    end
+    if retained then
+        Log("Home Assistant status 'online' (retained): no restart, nothing to do")
+        return
+    end
+    Log("Home Assistant (re)started: sending discovery and states again")
+    gLastPublished = {}
+    PublishMQTT(BRIDGE_STATUS_TOPIC, "online", 1, true)
+    RepublishDiscoveryAndStates("Home Assistant started")
+end
+
+-- Paced discovery for every device, then every state. Only one run at a time: a request during a
+-- run makes it run once more at its end.
+function RepublishDiscoveryAndStates(reason)
+    if not gMQTTConnected then
+        return
+    end
+    if gDiscoveryInProgress then
+        Log("Discovery already being sent: once more when it finishes (" .. tostring(reason) .. ")")
+        gDiscoveryRerun = true
+        return
+    end
+    Log("Sending discovery for all devices (" .. tostring(reason) .. ")")
+    PublishAllDiscovery(true, function()
+        RunWithCachedSettings(PublishAllStates)
+        if gDiscoveryRerun then
+            gDiscoveryRerun = false
+            RepublishDiscoveryAndStates("requested during the last run")
+        end
+    end)
+end
+
+-- Every monitored device's current state, from what the controller and the cached Light V2 settings
+-- say (no new reads from the light proxies)
+function PublishAllStates()
+    if not gMQTTConnected then
+        return
+    end
+    for _, lightID in ipairs(gMonitoredLights) do
+        PublishLightState(lightID)
+        if IsLEDControlEnabled() then
+            PublishAllLEDStates(lightID)
+        end
+        if IsAdvancedDimmerControlEnabled() then
+            PublishDimmerAdvancedControlStates(lightID)
+        end
+    end
+    for _, switchID in ipairs(gMonitoredSwitches) do
+        PublishSwitchState(switchID)
+        if IsLEDControlEnabled() then
+            PublishAllLEDStates(switchID)
+        end
+    end
+    for _, outletID in ipairs(gMonitoredOutlets) do
+        PublishOutletState(outletID)
+    end
+    for _, thermostatID in ipairs(gMonitoredThermostats) do
+        PublishThermostatState(thermostatID)
+        PublishThermostatButtonLEDState(thermostatID)
+    end
+    for _, roomID in ipairs(gMonitoredMediaRooms) do
+        PublishMediaRoomState(roomID)
+    end
+    for _, sensorID in ipairs(gMonitoredContactSensors) do
+        PublishContactSensorState(sensorID)
+    end
 end
 
 -- Connection Functions
 function IsBrokerConfigured()
     local ip = Properties["MQTT Broker IP"]
     return ip ~= nil and ip ~= "" and ip ~= BROKER_IP_PLACEHOLDER
+end
+
+-- The broker port of the current connection (the property may have changed since it was opened)
+function GetConnPort()
+    return gConnPort or tonumber(Properties["MQTT Broker Port"]) or 1883
+end
+
+function SendToBroker(packet)
+    C4:SendToNetwork(MQTT_BINDING_ID, GetConnPort(), packet)
 end
 
 function ConnectToBroker()
@@ -5318,11 +6174,28 @@ function ConnectToBroker()
         return false
     end
 
+    -- This is the connect attempt in flight: a pending reconnect is no longer needed
+    if gReconnectTimer then
+        CancelTimerObject(gReconnectTimer)
+        gReconnectTimer = nil
+    end
+    -- Already connected (the start-up timer after a connect by other means): nothing to do. The
+    -- Connect action closes a connection first.
+    if gConnected then
+        Log("Already connected to the MQTT broker")
+        return true
+    end
+
     Log("========================================")
     Log("Connecting to MQTT Broker: " .. ip .. ":" .. port)
     Log("========================================")
 
     C4:UpdateProperty("Connection Status", "Connecting...")
+
+    -- The address this connection uses until it is closed
+    gConnIP, gConnPort = ip, port
+    gConnecting = true
+    gConnectStarted = os.time()
 
     -- Create dynamic network connection using C4's native network stack
     C4:CreateNetworkConnection(MQTT_BINDING_ID, ip, "TCP")
@@ -5335,27 +6208,79 @@ function ConnectToBroker()
     return true
 end
 
+-- Reconnect after a lost or failed connection: 2 s, then doubling up to 60 s while attempts fail
+-- (reset by a CONNACK). Only one reconnect is ever pending. force: replace a pending one and
+-- reconnect even with Auto Reconnect disabled (the broker settings were changed).
+function ScheduleReconnect(force)
+    if gReconnectTimer then
+        if not force then
+            return
+        end
+        CancelTimerObject(gReconnectTimer)
+        gReconnectTimer = nil
+    end
+    local delay = math.floor(math.min(TIMER_INTERVALS.RECONNECT_MIN * 2 ^ gReconnectAttempts, TIMER_INTERVALS.RECONNECT_MAX))
+    gReconnectAttempts = gReconnectAttempts + 1
+    gStats.reconnects = gStats.reconnects + 1
+    Log("Reconnecting in " .. (delay / 1000) .. " s")
+    local timer
+    timer = SetUntrackedTimer(delay, function()
+        if gReconnectTimer ~= timer then
+            return  -- replaced or cancelled
+        end
+        gReconnectTimer = nil
+        if gManualDisconnect then
+            return
+        end
+        if not force and (Properties["Auto Reconnect"] or "Enabled") ~= "Enabled" then
+            return
+        end
+        if gConnected or gMQTTConnected then
+            return
+        end
+        if gConnecting and os.time() - gConnectStarted < 30 then
+            return
+        end
+        ConnectToBroker()
+    end)
+    gReconnectTimer = timer
+end
+
 -- C4 Network Callback: Called when connection status changes
 function OnConnectionStatusChanged(idBinding, nPort, strStatus)
     if idBinding ~= MQTT_BINDING_ID then
         return
     end
 
-    Log("Connection status changed: " .. strStatus .. " (port " .. nPort .. ")")
+    Log("Connection status changed: " .. tostring(strStatus) .. " (port " .. tostring(nPort) .. ")")
+
+    -- A late event of a connection on a port no longer used (the port property was changed)
+    if gConnPort and tonumber(nPort) and tonumber(nPort) ~= gConnPort then
+        Log("  ignored: not the current connection's port (" .. gConnPort .. ")")
+        return
+    end
 
     if strStatus == "ONLINE" then
         Log("TCP connected!")
+        gConnecting = false
         gConnected = true
         gMQTTBuffer = ""  -- A partial packet from the last connection would swallow the CONNACK
+        gLastInbound = os.time()
         C4:UpdateProperty("Connection Status", "TCP Connected")
 
         SendMQTTConnect()
         -- Note: No need to call StartReceiveLoop() - data will arrive via ReceivedFromNetwork callback
     elseif strStatus == "OFFLINE" then
         Log("TCP connection lost")
+        gConnecting = false
         gConnected = false
         gMQTTConnected = false
+        gMQTTBuffer = ""
+        CancelConnectionTimers()
         C4:UpdateProperty("Connection Status", "Disconnected")
+        if not gManualDisconnect and (Properties["Auto Reconnect"] or "Enabled") == "Enabled" and IsBrokerConfigured() then
+            ScheduleReconnect()
+        end
     end
 end
 
@@ -5364,8 +6289,7 @@ function SendMQTTConnect()
         return false
     end
 
-    local packet = BuildMQTTConnect()
-    C4:SendToNetwork(MQTT_BINDING_ID, tonumber(Properties["MQTT Broker Port"]) or 1883, packet)
+    SendToBroker(BuildMQTTConnect())
 
     Log("MQTT CONNECT sent")
     C4:UpdateProperty("Connection Status", "Waiting for CONNACK...")
@@ -5373,355 +6297,63 @@ function SendMQTTConnect()
     return true
 end
 
+-- Command topics: wildcard filters that cover every entity's /set topic (see COMMAND_TOPIC_FILTERS),
+-- so a device added later is controllable at once; HandleMQTTCommand picks out the topics of
+-- monitored devices. Also Home Assistant's birth message. One SUBSCRIBE packet.
 function SubscribeToCommandTopics()
     if not gMQTTConnected then
         Log("Cannot subscribe - not connected")
         return false
     end
 
-    Log("========================================")
-    Log("Subscribing to command topics for all devices...")
-
-    -- Forward declarations for mutual recursion
-    local SubscribeNextLight
-    local SubscribeNextSwitch
-    local SubscribeNextOutlet
-    local SubscribeNextThermostat
-    local SubscribeToLEDTopics
-    local SubscribeToAdvancedDimmerControlTopics
-    local SubscribeNextMediaRoom
-
-    -- Subscribe to light command topics
-    local lightIndex = 1
-    SubscribeNextLight = function()
-        if lightIndex <= #gMonitoredLights then
-            local lightID = gMonitoredLights[lightIndex]
-            local proxyID = GetProxyID(lightID)
-            local lightName = C4:GetDeviceDisplayName(proxyID)
-
-            if lightName then
-                -- Use device ID for topic (consistent with discovery)
-                local topic = "homeassistant/light/control4_" .. lightID .. "/set"
-
-                local packet = BuildMQTTSubscribe(topic, 1)
-                C4:SendToNetwork(MQTT_BINDING_ID, tonumber(Properties["MQTT Broker Port"]) or 1883, packet)
-                Log("  Subscribed to: " .. topic .. " (" .. lightName .. ")")
-            end
-
-            lightIndex = lightIndex + 1
-            -- Delay between subscriptions
-            SafeSetTimer(TIMER_INTERVALS.SUBSCRIPTION_DELAY, function()
-                SubscribeNextLight()
-            end)
-        else
-            Log("Light subscription complete")
-            -- After lights, subscribe to switches
-            SubscribeNextSwitch()
-        end
+    local topics = {}
+    for _, filter in ipairs(COMMAND_TOPIC_FILTERS) do
+        table.insert(topics, filter)
     end
+    table.insert(topics, HA_STATUS_TOPIC)
 
-    -- Subscribe to switch command topics
-    local switchIndex = 1
-    SubscribeNextSwitch = function()
-        if switchIndex <= #gMonitoredSwitches then
-            local switchID = gMonitoredSwitches[switchIndex]
-            local proxyID = GetProxyID(switchID)
-            local switchName = C4:GetDeviceDisplayName(proxyID)
-
-            if switchName then
-                local topic = "homeassistant/switch/control4_" .. switchID .. "/set"
-
-                local packet = BuildMQTTSubscribe(topic, 1)
-                C4:SendToNetwork(MQTT_BINDING_ID, tonumber(Properties["MQTT Broker Port"]) or 1883, packet)
-                Log("  Subscribed to: " .. topic .. " (" .. switchName .. ")")
-            end
-
-            switchIndex = switchIndex + 1
-            -- Delay between subscriptions
-            SafeSetTimer(TIMER_INTERVALS.SUBSCRIPTION_DELAY, function()
-                SubscribeNextSwitch()
-            end)
-        else
-            Log("Switch subscription complete")
-            -- After switches, subscribe to outlets
-            SubscribeNextOutlet()
-        end
-    end
-
-    -- Subscribe to outlet command topics
-    local outletIndex = 1
-    SubscribeNextOutlet = function()
-        if outletIndex <= #gMonitoredOutlets then
-            local outletID = gMonitoredOutlets[outletIndex]
-            local proxyID = GetProxyID(outletID)
-            local outletName = C4:GetDeviceDisplayName(proxyID)
-
-            if outletName then
-                local topic = "homeassistant/switch/control4_" .. outletID .. "/set"
-
-                local packet = BuildMQTTSubscribe(topic, 1)
-                C4:SendToNetwork(MQTT_BINDING_ID, tonumber(Properties["MQTT Broker Port"]) or 1883, packet)
-                Log("  Subscribed to: " .. topic .. " (" .. outletName .. ")")
-            end
-
-            outletIndex = outletIndex + 1
-            -- Delay between subscriptions
-            SafeSetTimer(TIMER_INTERVALS.SUBSCRIPTION_DELAY, function()
-                SubscribeNextOutlet()
-            end)
-        else
-            Log("Outlet subscription complete")
-            -- After outlets, subscribe to LED topics if enabled
-            if IsLEDControlEnabled() then
-                SubscribeToLEDTopics()
-            elseif IsAdvancedDimmerControlEnabled() then
-                SubscribeToAdvancedDimmerControlTopics()
-            else
-                SubscribeNextThermostat()
-            end
-        end
-    end
-
-    -- Subscribe to LED command topics for both lights and fans
-    SubscribeToLEDTopics = function()
-        -- Combine lights and switches into one list
-        local allDevices = {}
-        for _, lightID in ipairs(gMonitoredLights) do
-            table.insert(allDevices, lightID)
-        end
-        for _, switchID in ipairs(gMonitoredSwitches) do
-            table.insert(allDevices, switchID)
-        end
-
-        if #allDevices == 0 then
-            Log("No LED devices to subscribe to")
-            -- After LEDs, subscribe to advanced dimmer controls if enabled
-            if IsAdvancedDimmerControlEnabled() then
-                SubscribeToAdvancedDimmerControlTopics()
-            else
-                SubscribeNextThermostat()
-            end
-            return
-        end
-
-        local deviceIndex = 1
-        local ledSuffixes = {"top_on", "top_off", "bottom_on", "bottom_off"}
-        local ledIndex = 1
-
-        local SubscribeNextLED
-        SubscribeNextLED = function()
-            if deviceIndex <= #allDevices then
-                local deviceID = allDevices[deviceIndex]
-                local proxyID = GetProxyID(deviceID)
-                local deviceName = C4:GetDeviceDisplayName(proxyID)
-
-                if deviceName and ledIndex <= #ledSuffixes then
-                    local suffix = ledSuffixes[ledIndex]
-                    local topic = "homeassistant/text/control4_" .. deviceID .. "/" .. suffix .. "/set"
-
-                    local packet = BuildMQTTSubscribe(topic, 1)
-                    C4:SendToNetwork(MQTT_BINDING_ID, tonumber(Properties["MQTT Broker Port"]) or 1883, packet)
-                    Log("  Subscribed to LED text: " .. topic)
-
-                    -- Move to next LED suffix
-                    ledIndex = ledIndex + 1
-                    if ledIndex > #ledSuffixes then
-                        -- Move to next device
-                        ledIndex = 1
-                        deviceIndex = deviceIndex + 1
-                    end
-
-                    SafeSetTimer(TIMER_INTERVALS.SUBSCRIPTION_DELAY, function()
-                        SubscribeNextLED()
-                    end)
-                else
-                    -- Skip devices without names
-                    deviceIndex = deviceIndex + 1
-                    ledIndex = 1
-                    if deviceIndex <= #allDevices then
-                        SafeSetTimer(TIMER_INTERVALS.SUBSCRIPTION_DELAY, function()
-                            SubscribeNextLED()
-                        end)
-                    else
-                        Log("LED subscription complete")
-                        -- After LEDs, subscribe to advanced dimmer controls if enabled
-                        if IsAdvancedDimmerControlEnabled() then
-                            SubscribeToAdvancedDimmerControlTopics()
-                        else
-                            SubscribeNextThermostat()
-                        end
-                    end
-                end
-            else
-                Log("LED subscription complete")
-                -- After LEDs, subscribe to advanced dimmer controls if enabled
-                if IsAdvancedDimmerControlEnabled() then
-                    SubscribeToAdvancedDimmerControlTopics()
-                else
-                    SubscribeNextThermostat()
-                end
-            end
-        end
-
-        -- Start LED subscriptions
-        SubscribeNextLED()
-    end
-
-    -- Subscribe to advanced dimmer control command topics (only for lights/dimmers)
-    SubscribeToAdvancedDimmerControlTopics = function()
-        if #gMonitoredLights == 0 then
-            Log("No dimmers to subscribe to for advanced controls")
-            SubscribeNextThermostat()
-            return
-        end
-
-        local lightIndex = 1
-        local controlSuffixes = {"min_on_level", "max_on_level", "preset_level", "click_ramp_rate_up", "click_ramp_rate_down", "hold_ramp_rate_up", "hold_ramp_rate_down"}
-        local controlIndex = 1
-
-        local SubscribeNextControl
-        SubscribeNextControl = function()
-            if lightIndex <= #gMonitoredLights then
-                local lightID = gMonitoredLights[lightIndex]
-                local proxyID = GetProxyID(lightID)
-                local lightName = C4:GetDeviceDisplayName(proxyID)
-
-                if lightName and controlIndex <= #controlSuffixes then
-                    local suffix = controlSuffixes[controlIndex]
-                    local topic = "homeassistant/number/control4_" .. lightID .. "_" .. suffix .. "/set"
-
-                    local packet = BuildMQTTSubscribe(topic, 1)
-                    C4:SendToNetwork(MQTT_BINDING_ID, tonumber(Properties["MQTT Broker Port"]) or 1883, packet)
-                    Log("  Subscribed to dimmer control: " .. topic)
-
-                    -- Move to next control suffix
-                    controlIndex = controlIndex + 1
-                    if controlIndex > #controlSuffixes then
-                        -- Move to next light
-                        controlIndex = 1
-                        lightIndex = lightIndex + 1
-                    end
-
-                    SafeSetTimer(TIMER_INTERVALS.SUBSCRIPTION_DELAY, function()
-                        SubscribeNextControl()
-                    end)
-                else
-                    -- Skip lights without names
-                    lightIndex = lightIndex + 1
-                    controlIndex = 1
-                    if lightIndex <= #gMonitoredLights then
-                        SafeSetTimer(TIMER_INTERVALS.SUBSCRIPTION_DELAY, function()
-                            SubscribeNextControl()
-                        end)
-                    else
-                        Log("Advanced dimmer control subscription complete")
-                        SubscribeNextThermostat()
-                    end
-                end
-            else
-                Log("Advanced dimmer control subscription complete")
-                SubscribeNextThermostat()
-            end
-        end
-
-        -- Start advanced control subscriptions
-        SubscribeNextControl()
-    end
-
-    -- Subscribe to thermostat command topics
-    local thermostatIndex = 1
-    local commandTopicIndex = 1
-    local commandTopicSuffixes = {"/mode/set", "/temperature/set", "/temperature_low/set", "/temperature_high/set", "/fan_mode/set"}
-    local subscribingLED = false
-
-    SubscribeNextThermostat = function()
-        if thermostatIndex <= #gMonitoredThermostats then
-            local thermostatID = gMonitoredThermostats[thermostatIndex]
-            -- thermostatID is device ID, get proxy for display name
-            local proxyID = GetProxyID(thermostatID)
-            local thermostatName = C4:GetDeviceDisplayName(proxyID)
-
-            if thermostatName then
-                if not subscribingLED then
-                    -- Subscribe to the current command topic
-                    local baseTopic = "homeassistant/climate/control4_" .. thermostatID
-                    local topic = baseTopic .. commandTopicSuffixes[commandTopicIndex]
-
-                    local packet = BuildMQTTSubscribe(topic, 1)
-                    C4:SendToNetwork(MQTT_BINDING_ID, tonumber(Properties["MQTT Broker Port"]) or 1883, packet)
-                    Log("  Subscribed to: " .. topic .. " (" .. thermostatName .. ")")
-
-                    -- Move to next command topic
-                    commandTopicIndex = commandTopicIndex + 1
-
-                    -- If we've subscribed to all command topics for this thermostat, subscribe to LED if enabled
-                    if commandTopicIndex > #commandTopicSuffixes then
-                        commandTopicIndex = 1
-                        if IsLEDControlEnabled() then
-                            subscribingLED = true
-                        else
-                            thermostatIndex = thermostatIndex + 1
-                        end
-                    end
-                else
-                    -- Subscribe to LED topic for this thermostat
-                    local topic = "homeassistant/text/control4_thermostat_" .. thermostatID .. "_button_led/set"
-                    local packet = BuildMQTTSubscribe(topic, 1)
-                    C4:SendToNetwork(MQTT_BINDING_ID, tonumber(Properties["MQTT Broker Port"]) or 1883, packet)
-                    Log("  Subscribed to thermostat LED: " .. topic .. " (" .. thermostatName .. ")")
-
-                    -- Move to next thermostat
-                    subscribingLED = false
-                    thermostatIndex = thermostatIndex + 1
-                end
-            else
-                -- Skip thermostats without names
-                commandTopicIndex = 1
-                subscribingLED = false
-                thermostatIndex = thermostatIndex + 1
-            end
-
-            -- Delay between subscriptions
-            SafeSetTimer(TIMER_INTERVALS.SUBSCRIPTION_DELAY, function()
-                SubscribeNextThermostat()
-            end)
-        else
-            Log("Thermostat subscription complete")
-            -- After thermostats, subscribe to media rooms
-            SubscribeNextMediaRoom()
-        end
-    end
-
-    -- Subscribe to media room command topics
-    local mediaRoomIndex = 1
-    SubscribeNextMediaRoom = function()
-        if mediaRoomIndex <= #gMonitoredMediaRooms then
-            local roomID = gMonitoredMediaRooms[mediaRoomIndex]
-            local roomName = C4:GetDeviceDisplayName(roomID)
-
-            if roomName then
-                local topic = "homeassistant/media_player/control4_room_" .. roomID .. "/set"
-
-                local packet = BuildMQTTSubscribe(topic, 1)
-                C4:SendToNetwork(MQTT_BINDING_ID, tonumber(Properties["MQTT Broker Port"]) or 1883, packet)
-                Log("  Subscribed to: " .. topic .. " (" .. roomName .. ")")
-            end
-
-            mediaRoomIndex = mediaRoomIndex + 1
-            -- Delay between subscriptions
-            SafeSetTimer(TIMER_INTERVALS.SUBSCRIPTION_DELAY, function()
-                SubscribeNextMediaRoom()
-            end)
-        else
-            Log("Media room subscription complete")
-            Log("========================================")
-        end
-    end
-
-    -- Each step moves on to the next one when it has nothing to do
-    SubscribeNextLight()
-
+    local packet, packetID = BuildMQTTSubscribe(topics, 1)
+    gPendingSubscribes[packetID] = topics
+    SendToBroker(packet)
+    Log("Subscribed to command topics and Home Assistant status")
     return true
+end
+
+-- The broker accepted the connection
+function OnMQTTConnected()
+    gMQTTConnected = true
+    gReconnectAttempts = 0
+    gLastPublished = {}
+    gPendingSubscribes = {}
+    gLastInbound = os.time()
+    C4:UpdateProperty("Connection Status", "MQTT Connected ✓")
+    Log("========================================")
+    Log("SUCCESS! MQTT Connected")
+    Log("========================================")
+
+    -- Entities become available again (the Will said offline)
+    PublishMQTT(BRIDGE_STATUS_TOPIC, "online", 1, true)
+
+    -- Devices deleted from the project while disconnected leave Home Assistant now
+    PublishPendingConfigRemovals()
+
+    StartKeepAlive()
+
+    -- Commands are taken from here on
+    SubscribeToCommandTopics()
+
+    -- States first (anything that changed while disconnected), then discovery paced device by
+    -- device, then all states again. All from variables and cached Light V2 settings: no
+    -- blocking SendUIRequest reads, so a command from Home Assistant is never kept waiting.
+    if #gMonitoredLights > 0 or #gMonitoredSwitches > 0 or #gMonitoredOutlets > 0 or #gMonitoredThermostats > 0 or #gMonitoredMediaRooms > 0 then
+        Log("Publishing initial states...")
+        SafeSetTimer(TIMER_INTERVALS.RECONNECT_DELAY, function()
+            RunWithCachedSettings(PublishAllStates)
+        end)
+    end
+    SafeSetTimer(TIMER_INTERVALS.RECONNECT_DELAY + TIMER_INTERVALS.DISCOVERY_DELAY, function()
+        RepublishDiscoveryAndStates("connected")
+    end)
 end
 
 -- C4 Network Callback: Called when data is received from the network
@@ -5738,13 +6370,17 @@ function ReceivedFromNetwork(idBinding, nPort, strData)
         return
     end
 
+    gLastInbound = os.time()
     gStats.messagesReceived = gStats.messagesReceived + 1
-    C4:UpdateProperty("Messages Received", tostring(gStats.messagesReceived))
+    UpdateStatsProperties()
 
-    -- Check buffer size limit before adding
+    -- Out of step with the broker (a packet larger than we take, or a stream we can't parse): start
+    -- a clean connection rather than guess where the next packet begins
     if #gMQTTBuffer + #strData > LIMITS.MAX_BUFFER_SIZE then
-        LogError("Buffer overflow detected - clearing buffer (was " .. #gMQTTBuffer .. " bytes)")
-        gMQTTBuffer = ""
+        LogError("Receive buffer overflow (" .. (#gMQTTBuffer + #strData) .. " bytes) - reconnecting")
+        DisconnectFromBroker()
+        ScheduleReconnect()
+        return
     end
 
     -- Add to buffer
@@ -5752,9 +6388,6 @@ function ReceivedFromNetwork(idBinding, nPort, strData)
 
     -- Process all complete packets in buffer
     while #gMQTTBuffer >= 2 do
-        local firstByte = string.byte(gMQTTBuffer, 1)
-        local messageType = math.floor(firstByte / 16)
-
         local remainingLength, offset = DecodeMQTTLength(gMQTTBuffer, 2)
 
         if not remainingLength then
@@ -5763,9 +6396,10 @@ function ReceivedFromNetwork(idBinding, nPort, strData)
 
         -- Validate packet size
         if remainingLength > LIMITS.MAX_PACKET_SIZE then
-            LogError("Invalid packet size: " .. remainingLength .. " bytes (max " .. LIMITS.MAX_PACKET_SIZE .. ")")
-            gMQTTBuffer = ""
-            break
+            LogError("Invalid packet size: " .. remainingLength .. " bytes (max " .. LIMITS.MAX_PACKET_SIZE .. ") - reconnecting")
+            DisconnectFromBroker()
+            ScheduleReconnect()
+            return
         end
 
         -- Total packet length = fixed header (1 byte) + encoded length bytes + remaining length
@@ -5779,37 +6413,25 @@ function ReceivedFromNetwork(idBinding, nPort, strData)
         local packet = string.sub(gMQTTBuffer, 1, totalLength)
         gMQTTBuffer = string.sub(gMQTTBuffer, totalLength + 1)
 
-        -- Process packet
-        local result = ParseMQTTPacket(packet)
+        -- Process packet (an error in one packet doesn't stop the ones after it)
+        local ok, result = pcall(ParseMQTTPacket, packet)
+        if not ok then
+            LogError("MQTT packet handling failed: " .. tostring(result))
+            result = nil
+        end
 
         if result == "CONNACK_SUCCESS" then
-            gMQTTConnected = true
-            C4:UpdateProperty("Connection Status", "MQTT Connected ✓")
-            Log("========================================")
-            Log("SUCCESS! MQTT Connected")
-            Log("========================================")
-
-            StartKeepAlive()
-
-            SafeSetTimer(TIMER_INTERVALS.AUTO_CONNECT_DELAY, function()
-                Log("Initiating command topic subscriptions...")
-                SubscribeToCommandTopics()
-            end)
-
-            if #gMonitoredLights > 0 or #gMonitoredSwitches > 0 or #gMonitoredOutlets > 0 or #gMonitoredThermostats > 0 or #gMonitoredMediaRooms > 0 then
-                Log("Publishing initial states...")
-                SafeSetTimer(TIMER_INTERVALS.RECONNECT_DELAY, function()
-                    RefreshAllDeviceStates("LIGHT")
-                    RefreshAllDeviceStates("SWITCH")
-                    RefreshAllDeviceStates("OUTLET")
-                    RefreshAllDeviceStates("THERMOSTAT")
-                    RefreshAllDeviceStates("MEDIA_ROOM")
-                end)
-            end
-
+            OnMQTTConnected()
         elseif result == "CONNACK_FAILED" then
             DisconnectFromBroker()
+            if not gManualDisconnect and (Properties["Auto Reconnect"] or "Enabled") == "Enabled" then
+                ScheduleReconnect()
+            end
             return
+        end
+
+        if not gConnected then
+            return  -- a handler closed the connection
         end
     end
 end
@@ -5818,27 +6440,55 @@ function DisconnectFromBroker()
     Log("Disconnecting from MQTT broker...")
 
     CancelConnectionTimers()
+    if gReconnectTimer then
+        CancelTimerObject(gReconnectTimer)
+        gReconnectTimer = nil
+    end
 
-    -- Disconnect using C4 network stack
-    C4:NetDisconnect(MQTT_BINDING_ID, tonumber(Properties["MQTT Broker Port"]) or 1883)
+    -- Disconnect using C4 network stack, on the port the connection was opened with
+    C4:NetDisconnect(MQTT_BINDING_ID, GetConnPort())
 
     gConnected = false
     gMQTTConnected = false
+    gConnecting = false
     gMQTTBuffer = ""
     C4:UpdateProperty("Connection Status", "Disconnected")
     Log("Disconnected")
 end
 
+-- Keep alive: a PINGREQ every PINGREQ_INTERVAL seconds, and a liveness check every tick. The
+-- broker answers every PINGREQ, so nothing from it for 1.5x the keep alive means the connection
+-- is dead (a half-open TCP connection never reports OFFLINE): reconnect.
 function StartKeepAlive()
-    if gKeepAliveTimer then
-        gKeepAliveTimer:Cancel()
-    end
-    
-    gKeepAliveTimer = C4:SetTimer(45000, function(timer)
-        SendPingReq()
+    CancelTimerObject(gKeepAliveTimer)
+    gLastPingSent = os.time()
+    gLastInbound = os.time()
+
+    gKeepAliveTimer = C4:SetTimer(TIMER_INTERVALS.KEEPALIVE_TICK, function(timer)
+        local ok, err = pcall(KeepAliveTick)
+        if not ok then
+            LogError("Keep-alive error: " .. tostring(err))
+        end
     end, true)
-    
-    Log("Keep-alive started (45s interval)")
+
+    Log("Keep-alive started (PINGREQ every " .. TIMER_INTERVALS.PINGREQ_INTERVAL .. " s, dead after " ..
+        (MQTT_KEEPALIVE_SECONDS * 1.5) .. " s of silence)")
+end
+
+function KeepAliveTick()
+    if not gMQTTConnected then
+        return
+    end
+    local now = os.time()
+    if now - gLastInbound > MQTT_KEEPALIVE_SECONDS * 1.5 then
+        LogError("Nothing from the broker for " .. (now - gLastInbound) .. " s - connection dead, reconnecting")
+        DisconnectFromBroker()
+        ScheduleReconnect()
+        return
+    end
+    if now - gLastPingSent >= TIMER_INTERVALS.PINGREQ_INTERVAL then
+        SendPingReq()
+    end
 end
 
 function SendPingReq()
@@ -5848,8 +6498,8 @@ function SendPingReq()
         return
     end
 
-    local packet = BuildMQTTPingReq()
-    C4:SendToNetwork(MQTT_BINDING_ID, tonumber(Properties["MQTT Broker Port"]) or 1883, packet)
+    gLastPingSent = os.time()
+    SendToBroker(BuildMQTTPingReq())
     Log("PINGREQ sent")
 end
 
@@ -5857,7 +6507,7 @@ end
 -- running through a disconnect so that it can reconnect.
 function CancelConnectionTimers()
     if gKeepAliveTimer then
-        gKeepAliveTimer:Cancel()
+        CancelTimerObject(gKeepAliveTimer)
         gKeepAliveTimer = nil
     end
     -- Cancel all tracked timers
@@ -5865,11 +6515,26 @@ function CancelConnectionTimers()
         pcall(function() timer:Cancel() end)
     end
     gActiveTimers = {}
+    -- Their work stops with them
+    gDiscoveryInProgress = false
+    gDiscoveryRerun = false
 end
 
 -- Every timer, for when the driver shuts down
 function CancelTimers()
     CancelConnectionTimers()
+    if gReconnectTimer then
+        CancelTimerObject(gReconnectTimer)
+        gReconnectTimer = nil
+    end
+    if gStatsTimer then
+        CancelTimerObject(gStatsTimer)
+        gStatsTimer = nil
+    end
+    if gRescanTimer then
+        CancelTimerObject(gRescanTimer)
+        gRescanTimer = nil
+    end
     if gWatchdogTimer then
         gWatchdogTimer:Cancel()
         gWatchdogTimer = nil
@@ -5880,15 +6545,37 @@ function CancelTimers()
     end
 end
 
+-- Messages Sent / Received properties: at most every STATS_PROPERTY_INTERVAL seconds (a property
+-- update per message is work for Director and every Composer connected)
+function UpdateStatsProperties()
+    local now = os.time()
+    if now - gLastStatsUpdate >= TIMER_INTERVALS.STATS_PROPERTY_INTERVAL then
+        gLastStatsUpdate = now
+        C4:UpdateProperty("Messages Sent", tostring(gStats.messagesSent))
+        C4:UpdateProperty("Messages Received", tostring(gStats.messagesReceived))
+    elseif not gStatsTimer then
+        gStatsTimer = SetUntrackedTimer(TIMER_INTERVALS.STATS_PROPERTY_INTERVAL * 1000, function()
+            gStatsTimer = nil
+            gLastStatsUpdate = os.time()
+            C4:UpdateProperty("Messages Sent", tostring(gStats.messagesSent))
+            C4:UpdateProperty("Messages Received", tostring(gStats.messagesReceived))
+        end)
+    end
+end
+
 function PublishMQTT(topic, message, qos, retain)
     if not gMQTTConnected then
         LogError("Cannot publish - not connected")
         return false
     end
 
+    -- A state change publish (see RunSkippingUnchanged) doesn't send what was last sent
+    if gSkipUnchanged and gLastPublished[topic] == message then
+        return true
+    end
+
     local success, result = pcall(function()
-        local packet = BuildMQTTPublish(topic, message, qos, retain)
-        C4:SendToNetwork(MQTT_BINDING_ID, tonumber(Properties["MQTT Broker Port"]) or 1883, packet)
+        SendToBroker(BuildMQTTPublish(topic, message, qos, retain))
         return true
     end)
 
@@ -5896,14 +6583,16 @@ function PublishMQTT(topic, message, qos, retain)
         LogError("Publish failed with exception: " .. tostring(result))
         -- Trigger reconnect
         DisconnectFromBroker()
-        SafeSetTimer(TIMER_INTERVALS.RECONNECT_DELAY, function()
-            ConnectToBroker()
-        end)
+        ScheduleReconnect()
         return false
     end
 
+    -- Remember state payloads (not discovery configs, which are large and always sent)
+    if not string.find(topic, "/config$") then
+        gLastPublished[topic] = message
+    end
     gStats.messagesSent = gStats.messagesSent + 1
-    C4:UpdateProperty("Messages Sent", tostring(gStats.messagesSent))
+    UpdateStatsProperties()
     return true
 end
 
@@ -5922,10 +6611,16 @@ function ExecuteCommand(cmd, params)
     
     if cmd == "Connect" then
         gManualDisconnect = false
+        if gConnected then
+            DisconnectFromBroker()  -- (re)connect with the current settings
+        end
         ConnectToBroker()
         
     elseif cmd == "Disconnect" then
         gManualDisconnect = true
+        if gMQTTConnected then
+            PublishMQTT(BRIDGE_STATUS_TOPIC, "offline", 1, true)
+        end
         DisconnectFromBroker()
         
     elseif cmd == "PublishTest" then
@@ -5977,11 +6672,7 @@ function ExecuteCommand(cmd, params)
         DiscoverAllDevices("THERMOSTAT")
         Log("All device discovery complete")
 
-        -- Re-subscribe to MQTT command topics for all devices (including newly discovered)
-        if gMQTTConnected then
-            Log("Re-subscribing to MQTT command topics for newly discovered devices...")
-            SubscribeToCommandTopics()
-        end
+        -- No re-subscribing: the wildcard command subscriptions already cover new devices
 
     elseif cmd == "ListAll" then
         ListMonitoredDevices("LIGHT")

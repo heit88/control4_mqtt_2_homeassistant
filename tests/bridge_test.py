@@ -23,7 +23,8 @@ Properties = { ["Debug Mode"] = "Off", ["Enable Advanced Dimmer Controls"] = "Di
     ["MQTT Username"] = "", ["MQTT Password"] = "", ["Auto Reconnect"] = "Enabled",
     ["Contact Sensor Binding Map"] = "", ["Media Room IDs (comma separated)"] = "",
     ["Switch Device IDs (comma separated)"] = "" }
-mock = { vars = {}, names = {}, proxies = {}, persist = {}, sent = {}, props = {}, timers = {}, connects = 0 }
+mock = { vars = {}, names = {}, proxies = {}, persist = {}, sent = {}, props = {}, timers = {}, connects = 0,
+    cmds = {}, propCount = {}, disconnects = {}, addresses = {}, listeners = {} }
 C4 = setmetatable({}, { __index = function() return function() end end })
 function C4:GetDeviceVariable(id, var)
     local v = mock.vars[id] and mock.vars[id][var]
@@ -36,9 +37,14 @@ function C4:GetDevices() return {} end
 function C4:GetDeviceDisplayName(id) return mock.names[id] end
 function C4:PersistGetValue(k) return mock.persist[k] end
 function C4:PersistSetValue(k, v) mock.persist[k] = v end
-function C4:UpdateProperty(k, v) mock.props[k] = v end
+function C4:UpdateProperty(k, v) mock.props[k] = v; mock.propCount[k] = (mock.propCount[k] or 0) + 1 end
 function C4:SendToNetwork(_, _, data) table.insert(mock.sent, data) end
 function C4:NetConnect() mock.connects = mock.connects + 1 end
+function C4:NetDisconnect(_, port) table.insert(mock.disconnects, port) end
+function C4:CreateNetworkConnection(_, ip) table.insert(mock.addresses, ip) end
+function C4:SendToDevice(id, cmd, params) table.insert(mock.cmds, { id = id, cmd = cmd, params = params or {} }) end
+function C4:GetDeviceID() return 1234 end
+function C4:RegisterVariableListener(id, var) mock.listeners[id .. ":" .. var] = true end
 function C4:SetTimer(delay, fn, rep)
     local t = { delay = delay, fn = fn, rep = rep, cancelled = false }
     t.Cancel = function(self) self.cancelled = true end
@@ -75,8 +81,14 @@ function decode(pkt)
         if math.floor(b / 2) % 4 > 0 then j = j + 2 end
         return "PUB", string.sub(pkt, i + 2, i + 1 + tl), string.sub(pkt, j), b % 2
     elseif kind == 8 then
-        local tl = string.byte(pkt, i + 2) * 256 + string.byte(pkt, i + 3)
-        return "SUB", string.sub(pkt, i + 4, i + 3 + tl), "", 0
+        -- every topic filter, space separated
+        local filters, j = {}, i + 2
+        while j <= #pkt do
+            local tl = string.byte(pkt, j) * 256 + string.byte(pkt, j + 1)
+            table.insert(filters, string.sub(pkt, j + 2, j + 1 + tl))
+            j = j + 3 + tl
+        end
+        return "SUB", table.concat(filters, " "), "", 0
     elseif kind == 4 then
         return "PUBACK", "", "", 0
     end
@@ -86,6 +98,24 @@ function incoming_publish(flags, topic, payload, packetID)
     local vh = string.char(math.floor(#topic / 256), #topic % 256) .. topic
     if packetID then vh = vh .. string.char(math.floor(packetID / 256), packetID % 256) end
     return string.char(flags, #vh + #payload) .. vh .. payload
+end
+-- Fields of a CONNECT packet the driver sent
+function decode_connect(pkt)
+    local i = 2
+    repeat local c = string.byte(pkt, i); i = i + 1 until c < 128
+    local function str(at) local n = string.byte(pkt, at) * 256 + string.byte(pkt, at + 1); return string.sub(pkt, at + 2, at + 1 + n), at + 2 + n end
+    local proto, j = str(i)
+    local flags = string.byte(pkt, j + 1)
+    local keepalive = string.byte(pkt, j + 2) * 256 + string.byte(pkt, j + 3)
+    local r = { flags = flags, keepalive = keepalive }
+    r.client, j = str(j + 4)
+    if math.floor(flags / 4) % 2 == 1 then r.willTopic, j = str(j); r.willMessage, j = str(j) end
+    if math.floor(flags / 128) % 2 == 1 then r.user, j = str(j) end
+    if math.floor(flags / 64) % 2 == 1 then r.password, j = str(j) end
+    return r
+end
+function find_connect()
+    for _, p in ipairs(mock.sent) do if string.byte(p, 1) == 0x10 then return decode_connect(p) end end
 end
 CONNACK_OK = string.char(0x20, 0x02, 0x00, 0x00)
 CONNACK_REFUSED = string.char(0x20, 0x02, 0x00, 0x05)
@@ -106,7 +136,10 @@ class Bridge:
         self.lua.execute(MOCK)
         if setup:
             self.lua.execute(setup)
-        self.lua.execute(SRC + "\nfunction _timer_count() local n = 0; for _ in pairs(gActiveTimers) do n = n + 1 end; return n end\n")
+        # Test hooks inside the chunk, where the driver's locals are visible
+        self.lua.execute(SRC + "\nfunction _timer_count() local n = 0; for _ in pairs(gActiveTimers) do n = n + 1 end; return n end\n"
+                         "function _age_inbound(s) gLastInbound = gLastInbound - s end\n"
+                         "function _connected() return gConnected and gMQTTConnected end\n")
         if init:
             self.run("OnDriverInit(); OnDriverLateInit()")
 
@@ -299,9 +332,9 @@ configs = [t for t in b.topics() if t.endswith("/config")]
 check(any("control4_110" in t for t in configs) and any("control4_room_5" in t for t in configs) and GARAGE + "config" in configs,
       "outlet, media room and contact sensor are discovered")
 b = Bridge(OUTLET)
-b.connect(); b.clear()
-b.fire(4)
-check("homeassistant/switch/control4_110/set" in b.topics("SUB"), "outlets-only system subscribes to commands")
+b.clear(); b.connect()
+subs = " ".join(b.topics("SUB")).split()
+check("homeassistant/+/+/set" in subs, "outlets-only system subscribes to commands (wildcard covers its /set)")
 
 print("--- default_entity_id ---")
 b = Bridge(LIGHT + "; " + THERMOSTAT + "; " + ONE_CONTACT)
@@ -419,6 +452,349 @@ b.run('ExecuteCommand("Inspect Device", {["Device ID"] = "9"})')
 check(b.value("mock.inspected") is True, "the Inspect Device command works")
 
 check("<default>Off</default>" in XML and "<default>Print and Log</default>" not in XML, "debug logging is off by default")
+
+STATUS = "control4/bridge/status"
+
+import re
+xml_version = re.search(r"<version>([^<]+)</version>", XML).group(1)
+lua_version = re.search(r'local DRIVER_VERSION = "([^"]+)"', SRC).group(1)
+check(xml_version == lua_version and f"<model>MQTT Bridge v{xml_version}</model>" in XML,
+      f"driver.lua version matches driver.xml ({lua_version} / {xml_version})")
+
+print("--- Bridge availability: Will, online, offline ---")
+b = Bridge(LIGHT)
+b.online()
+c = b.value("find_connect()")
+check(c.flags & 0x04 and c.flags & 0x08 and not c.flags & 0x10 and c.flags & 0x20,
+      f"CONNECT has a Will at QoS 1, retained (flags {c.flags:#04x})")
+check(c.willTopic == STATUS and c.willMessage == "offline", "Will: control4/bridge/status = offline")
+check(c.keepalive == 60 and c.flags & 0x02, "keep alive 60 s, clean session as before")
+check(c.client.startswith("Control4_HA_1234_") and len(c.client) <= 23, f"client ID per instance: {c.client}")
+first_client = c.client
+b.run("ReceivedFromNetwork(6001, 1883, CONNACK_OK)")
+pubs = [s for s in b.sent() if s[0] == "PUB" and s[1] == STATUS]
+check(pubs and pubs[0][2] == "online" and pubs[0][3] == 1, "CONNACK: online published, retained")
+b.offline(); b.clear(); b.online()
+check(b.value("find_connect()").client == first_client, "the client ID stays the same when reconnecting")
+
+b = Bridge('Properties["MQTT Username"] = ""; Properties["MQTT Password"] = "secret"')
+b.online()
+c = b.value("find_connect()")
+check(not c.flags & 0x40 and not c.flags & 0x80 and c.password is None, "password without a user name: no password flag")
+b = Bridge('Properties["MQTT Username"] = "ha"; Properties["MQTT Password"] = "secret"')
+b.online()
+c = b.value("find_connect()")
+check(c.flags & 0xC0 == 0xC0 and c.user == "ha" and c.password == "secret", "user name and password: both sent, after the Will")
+
+b = Bridge(LIGHT)
+b.connect(); b.settle()
+b.run("OnDriverDestroyed()")
+pubs = [s for s in b.sent() if s[0] == "PUB" and s[1] == STATUS]
+check(pubs and pubs[-1][2] == "offline" and pubs[-1][3] == 1, "driver removed: offline published (retained) before disconnecting")
+
+print("--- Availability in every discovery config ---")
+b = Bridge(TRICKY)
+b.connect(); b.settle()
+b.run("PublishAllDiscovery()")
+b.fire(12)
+missing = []
+for t in b.topics():
+    if t.endswith("/config"):
+        cfg = json.loads(b.payloads(t)[0])
+        if not (cfg.get("availability_topic") == STATUS and cfg.get("payload_available") == "online"
+                and cfg.get("payload_not_available") == "offline"):
+            missing.append(t)
+check(not missing, f"every config depends on the bridge status ({missing[:3]})")
+room = json.loads(b.payloads("homeassistant/media_player/control4_room_5/config")[0])
+check(room["availability_mode"] == "all" and {"topic": "homeassistant/media_player/control4_room_5/availability"} in room["availability"],
+      "media room: bridge and its own topic, both must be online")
+check(json.loads(b.payloads("homeassistant/light/control4_100/config")[0])["unique_id"] == "control4_light_100", "unique IDs unchanged")
+
+print("--- Commands: wildcard subscriptions, retained /set ignored ---")
+b = Bridge(LIGHT)
+b.connect(); b.settle()
+check(not b.topics("SUB"), "no per-device SUBSCRIBEs any more")
+b.run('mock.proxies[200] = 201; mock.names[200] = "New"; mock.names[201] = "New"; mock.vars[201] = { [1000] = "0", [1001] = "0" }')
+b.run("AddLightToMonitor(200)")
+check(not b.topics("SUB"), "a light added later needs no new subscription")
+b.run('ReceivedFromNetwork(6001, 1883, incoming_publish(0x30, "homeassistant/light/control4_200/set", \'{"state":"ON"}\'))')
+check(b.value("#mock.cmds") == 1 and b.value("mock.cmds[1].id") == 201, "... and is controllable at once")
+b.run("mock.cmds = {}")
+b.run('ReceivedFromNetwork(6001, 1883, incoming_publish(0x31, "homeassistant/light/control4_100/set", \'{"state":"ON"}\'))')
+check(b.value("#mock.cmds") == 0, "a retained command (left on the broker) is ignored")
+check("retained" in str(b.value('mock.props["Last Error"]')), "and logged")
+b.clear()
+b.run('ReceivedFromNetwork(6001, 1883, incoming_publish(0x33, "homeassistant/light/control4_100/set", \'{"state":"ON"}\', 9))')
+check(b.value("#mock.cmds") == 0 and [s for s in b.sent() if s[0] == "PUBACK"], "retained QoS 1 command: acknowledged, not run")
+b.run('ReceivedFromNetwork(6001, 1883, incoming_publish(0x30, "homeassistant/light/somebody_else/set", \'{"state":"ON"}\'))')
+b.run('ReceivedFromNetwork(6001, 1883, incoming_publish(0x30, "homeassistant/switch/control4_999/set", "ON"))')
+check(b.value("#mock.cmds") == 0, "other integrations' and unmonitored devices' commands are ignored")
+b.run('function HandleMQTTCommand() error("boom") end')
+b.clear()
+b.run('ReceivedFromNetwork(6001, 1883, incoming_publish(0x32, "homeassistant/light/control4_100/set", "x", 5) .. string.char(0xD0, 0x00))')
+check([s for s in b.sent() if s[0] == "PUBACK"] and b.value("_connected()"), "a failing command is still acknowledged; the next packet is handled")
+b.run("mock.props['Last Error'] = nil; ReceivedFromNetwork(6001, 1883, string.char(0x90, 0x05, 0x00, 0x02, 0x01, 0x80, 0x01))")
+check("refused" in str(b.value('mock.props["Last Error"]')), "SUBACK failure (0x80) is logged")
+
+b = Bridge(THERMOSTAT)
+b.connect(); b.settle()
+b.run('ReceivedFromNetwork(6001, 1883, incoming_publish(0x30, "homeassistant/climate/control4_50/mode/set", "cool"))')
+check(b.value("#mock.cmds") == 1 and b.value("mock.cmds[1].cmd") == "SET_MODE_HVAC" and b.value("mock.cmds[1].id") == 51
+      and b.value("mock.cmds[1].params.MODE") == "Cool", "thermostat mode command reaches the thermostat as before")
+
+print("--- Home Assistant restarts ---")
+b = Bridge(LIGHT)
+b.connect(); b.settle(); b.fire(6); b.clear()
+b.run('ReceivedFromNetwork(6001, 1883, incoming_publish(0x31, "homeassistant/status", "online"))')
+b.fire(6)
+check("homeassistant/light/control4_100/config" not in b.topics(), "retained birth message (on subscribing): no second discovery run")
+b.run('ReceivedFromNetwork(6001, 1883, incoming_publish(0x30, "homeassistant/status", "online"))')
+b.fire(6)
+check("homeassistant/light/control4_100/config" in b.topics() and "homeassistant/light/control4_100/state" in b.topics(),
+      "birth message: discovery, then states, sent again")
+b = Bridge(LIGHT)
+b.clear(); b.connect(); b.fire(8)
+check("homeassistant/light/control4_100/config" in b.topics(), "discovery is sent again after every CONNACK")
+
+print("--- State publishing: immediate, no repeats ---")
+b = Bridge(LIGHT)
+b.connect(); b.settle(); b.fire(8); b.clear()
+LS = "homeassistant/light/control4_100/state"
+STATS_MS = 10000
+b.run("fire_timers()")  # the Messages Sent property: updated at most every 10 s, not part of a state publish
+timers_before = [b.value("mock.timers[%d].delay" % i) for i in range(1, b.value("#mock.timers") + 1)]
+b.run('mock.vars[101][1001] = "40"; OnWatchedVariableChanged(101, 1001, "40")')
+check([json.loads(p)["brightness"] for p in b.payloads(LS)] == [102], "a change is published within the callback")
+b.run('mock.vars[101][1001] = "60"; OnWatchedVariableChanged(101, 1001, "60")')
+b.run('mock.vars[101][1001] = "80"; OnWatchedVariableChanged(101, 1001, "80")')
+check([json.loads(p)["brightness"] for p in b.payloads(LS)] == [102, 153, 204], "each distinct change at once, none held back")
+check([b.value("mock.timers[%d].delay" % i) for i in range(1, b.value("#mock.timers") + 1) if b.value("mock.timers[%d].delay" % i) != STATS_MS] == [d for d in timers_before if d != STATS_MS],
+      "no timer started on the state path (only the 10 s statistics property throttle)")
+b.run('OnWatchedVariableChanged(101, 1000, "1")')
+check(len(b.payloads(LS)) == 3, "an identical payload is not sent again")
+b.run('mock.vars[101][1001] = "10"; OnWatchedVariableChanged(101, 1001, "10")')
+check(len(b.payloads(LS)) == 4 and json.loads(b.payloads(LS)[-1])["brightness"] == 25, "a change after an identical one is published at once")
+b.run('mock.vars[101][1001] = "40"; OnWatchedVariableChanged(101, 1001, "40"); mock.vars[101][1001] = "10"; OnWatchedVariableChanged(101, 1001, "10")')
+check([json.loads(p)["brightness"] for p in b.payloads(LS)][-2:] == [102, 25], "a quick change and back: both published")
+b.run("ExecuteCommand('RefreshAll', {})")
+check(len(b.payloads(LS)) == 7, "a refresh always publishes")
+b.run('OnWatchedVariableChanged(101, 1001, nil)')  # error inside: protected
+check(b.value("_connected()"), "an error in a variable change handler doesn't escape")
+
+b = Bridge(LIGHT)
+b.connect(); b.settle()
+before = b.value('mock.propCount["Messages Sent"]') or 0
+b.run("for i = 1, 50 do PublishMQTT('t/' .. i, 'x', 0, false) end")
+check((b.value('mock.propCount["Messages Sent"]') or 0) - before <= 1, "Messages Sent property not updated per message")
+b.run("fire_timers()")
+check(b.value('mock.props["Messages Sent"]') is not None and int(b.value('mock.props["Messages Sent"]')) >= 50,
+      "... but brought up to date within 10 s")
+
+print("--- Liveness and reconnecting ---")
+b = Bridge(LIGHT)
+b.connect(); b.settle()
+b.run("_age_inbound(80)"); b.fire()
+check(b.value("_connected()"), "80 s without a packet from the broker: still connected")
+b.run("_age_inbound(20)"); b.fire()
+check(not b.value("_connected()") and b.value("#mock.disconnects") >= 1, "over 90 s (1.5x keep alive) without a packet: disconnected")
+before = b.value("mock.connects")
+b.fire()
+check(b.value("mock.connects") == before + 1, "... and reconnects")
+b.connect()
+b.run("_age_inbound(60)"); b.run('ReceivedFromNetwork(6001, 1883, string.char(0xD0, 0x00))'); b.fire()
+check(b.value("_connected()"), "a PINGRESP counts as life")
+
+b = Bridge(LIGHT)
+b.fire(); b.connect(); b.settle()
+delays = []
+for _ in range(7):
+    b.offline()
+    delays.append(b.value("(function() for _, t in ipairs(mock.timers) do if t.delay >= 2000 and t.delay <= 60000 and t.delay ~= 15000 and not t.rep and not t.cancelled then return t.delay end end end)()"))
+    b.run("for _, t in ipairs(mock.timers) do if t.delay == %d then t.fn(t); t.cancelled = true end end" % delays[-1])
+    b.online()
+check(delays == [2000, 4000, 8000, 16000, 32000, 60000, 60000], f"reconnect backoff 2 s doubling to 60 s: {delays}")
+b.run("ReceivedFromNetwork(6001, 1883, CONNACK_OK)"); b.offline()
+check(b.value("(function() for _, t in ipairs(mock.timers) do if t.delay == 2000 and not t.cancelled and not t.rep then return true end end return false end)()"),
+      "a CONNACK resets the backoff")
+PENDING = "(function() local n = 0 for _, t in ipairs(mock.timers) do if ({[2000]=1,[4000]=1,[8000]=1,[16000]=1,[32000]=1,[60000]=1})[t.delay] and not t.rep and not t.cancelled then n = n + 1 end end return n end)()"
+n = b.value(PENDING)
+b.offline()
+b.run('ExecuteCommand("Disconnect", {}); ExecuteCommand("Connect", {})'); b.offline()
+n2 = b.value(PENDING)
+check(n == n2 == 1, "only one reconnect pending at a time")
+
+b = Bridge(LIGHT)
+b.connect(); b.settle()
+b.run('ReceivedFromNetwork(6001, 1883, string.char(0x30) .. string.char(0xFF, 0xFF, 0x03))')
+check(not b.value("_connected()") and b.value('mock.props["Connection Status"]') == "Disconnected", "oversize packet: disconnect (not just clear the buffer)")
+before = b.value("mock.connects")
+b.fire()
+check(b.value("mock.connects") == before + 1, "... and reconnect")
+
+b = Bridge(LIGHT)
+b.fire(); b.connect(); b.settle()
+b.run('Properties["MQTT Broker IP"] = "10.0.0.9"; Properties["MQTT Broker Port"] = "1884"; OnPropertyChanged("MQTT Broker IP")')
+check(b.value("mock.disconnects[#mock.disconnects]") == 1883, "broker changed: the old connection is closed on the port it was opened with")
+b.fire()
+check(b.value("mock.addresses[#mock.addresses]") == "10.0.0.9", "... and the new address is connected")
+b.run('OnConnectionStatusChanged(6001, 1883, "OFFLINE")')
+check(b.value('mock.props["Connection Status"]') == "Connecting...", "a late OFFLINE of the old port is ignored")
+b.clear(); b.run('OnConnectionStatusChanged(6001, 1884, "ONLINE")')
+check(b.value("find_connect()") is not None, "the new connection logs in")
+
+print("--- Lights not found ---")
+b = Bridge(LIGHT)
+b.connect(); b.settle()
+b.run("mock.names[101] = nil; mock.names[100] = nil; PublishLightState(100)")
+check(b.value('mock.persist["MonitoredLights"]') == "100" and "homeassistant/light/control4_100/config" not in b.topics(),
+      "a light whose name can't be read once is not removed")
+b.run("PublishLightState(100); PublishLightState(100)")
+check(b.value('mock.persist["MonitoredLights"]') == "100", "nor after 3 misses within a minute")
+b.run("ExecuteCommand('CleanupDeleted', {})")
+check(b.value('mock.persist["MonitoredLights"]') == "" and b.payloads("homeassistant/light/control4_100/config") == [""],
+      "the Cleanup action removes it at once")
+
+print("--- Thermostat: payload as before, fractional values safe on newer Lua ---")
+b = Bridge(THERMOSTAT)
+b.connect(); b.settle()
+b.run("PublishThermostatState(50)")
+st = json.loads(b.payloads("homeassistant/climate/control4_50/state")[-1])
+check(st["current_temperature"] == 72 and st["temperature"] == 68 and st["mode"] == "heat", f"integer values as before: {st}")
+raw_int = b.payloads("homeassistant/climate/control4_50/state")[-1]
+b.run('mock.vars[51][1130] = "72.6"; mock.vars[51][1138] = "45.5"; PublishThermostatState(50)')
+st = json.loads(b.payloads("homeassistant/climate/control4_50/state")[-1])
+check(st["current_temperature"] == 72 and st["humidity"] == 45, f"fractional values cut as Lua 5.1 '%d' did (runs on Lua 5.5): {st}")
+b.run('mock.vars[51][1130] = "72"; mock.vars[51][1138] = nil; PublishThermostatState(50)')
+check(b.payloads("homeassistant/climate/control4_50/state")[-1] == raw_int, "payload text unchanged for integer values")
+
+print("--- Remove All Entities ---")
+b = Bridge(TRICKY)
+b.connect(); b.settle()
+b.run("ExecuteCommand('RemoveAllEntities', {})")
+removed = {t for t in b.topics() if t.endswith("/config") and b.payloads(t) == [""]}
+for t in ("homeassistant/text/control4_thermostat_50_button_led/config", "homeassistant/media_player/control4_room_5/config",
+          "homeassistant/number/control4_100_preset_level/config", "homeassistant/text/control4_100_top_on/config",
+          "homeassistant/text/control4_120_top_on/config", "homeassistant/binary_sensor/gate_a_contact_sensor_state/config",
+          "homeassistant/sensor/gate_a_contact_sensor_battery/config"):
+    check(t in removed, f"removes {t}")
+
+print("--- Media room debounce ---")
+b = Bridge(ROOM)
+b.connect(); b.settle()
+b.run("PublishMediaRoomStateDebounced(5); PublishMediaRoomStateDebounced(5); PublishMediaRoomStateDebounced(5)")
+b.run("fire_timers()")
+check(len(b.payloads("homeassistant/media_player/control4_room_5/state")) == 1, "three quick changes: one publish (earlier timers cancelled)")
+
+print("--- Devices deleted from the project ---")
+PROJECT = (LIGHT + "; " + OUTLET + "; " + ROOM + "; " + THERMOSTAT + "; " + ONE_CONTACT + r"""
+mock.sysEvents = {}
+function C4:RegisterSystemEvent(id, item) table.insert(mock.sysEvents, id) end
+function C4:UnregisterVariableListener(id, var) mock.listeners[id .. ":" .. var] = nil end
+-- The room (5) is not a device in C4:GetDevices(), as on a controller
+mock.devices = { [100] = { deviceName = "Lamp", proxies = { [101] = true } },
+    [110] = { deviceName = "Socket", proxies = { [111] = true } },
+    [50] = { deviceName = "Hall", proxies = { [51] = true } },
+    [720] = { deviceName = "Sensor", proxies = {} } }
+function C4:GetDevices() if mock.devicesFail then error("not ready") end return mock.devices end
+function delete_device(id, proxy) mock.devices[id] = nil; mock.names[id] = nil; if proxy then mock.names[proxy] = nil end end
+-- Fire the live one-shot timers of one delay (the delete check's own), nothing else
+function fire_delay(d)
+    local batch = mock.timers
+    mock.timers = {}
+    local due = {}
+    for _, t in ipairs(batch) do
+        if t.delay == d and not t.rep and not t.cancelled then table.insert(due, t) else table.insert(mock.timers, t) end
+    end
+    for _, t in ipairs(due) do t.fn(t) end
+    return #due
+end
+function live_delay(d)
+    local n = 0
+    for _, t in ipairs(mock.timers) do if t.delay == d and not t.cancelled then n = n + 1 end end
+    return n
+end
+""")
+ITEM_REMOVED = 'OnSystemEvent(\'<systemevent name="OnItemRemoved"><itemid>100</itemid></systemevent>\')'
+
+
+def project():
+    b = Bridge(PROJECT)
+    b.connect(); b.settle(); b.fire(8); b.clear()
+    return b
+
+
+def emptied(b):
+    return [s[1] for s in b.sent() if s[0] == "PUB" and s[2] == "" and s[1].endswith("/config")]
+
+
+b = project()
+check([b.value("mock.sysEvents[%d]" % i) for i in range(1, b.value("#mock.sysEvents") + 1)] == [11],
+      "only OnItemRemoved (11) registered, not OnProjectChanged")
+check(b.value('mock.listeners["101:1001"]') is True, "light listener registered at start")
+b.run("delete_device(100, 101)")
+b.run(ITEM_REMOVED)
+check(b.value("gSystemEventRawLogged") is True, "the raw event is logged (once per load)")
+b.run("fire_delay(3000)")
+check(emptied(b) == [] and b.value("live_delay(5000)") == 1, "3 s after the event: missing, checked again in 5 s, nothing removed yet")
+b.run("fire_delay(5000)")
+gone = emptied(b)
+check("homeassistant/light/control4_100/config" in gone and "homeassistant/text/control4_100_top_on/config" in gone
+      and "homeassistant/number/control4_100_preset_level/config" in gone and "homeassistant/number/control4_100_hold_ramp_rate_down/config" in gone,
+      "deleted light: light, LED text and dimmer number configs emptied")
+check(all(t.startswith("homeassistant/") and "control4_100" in t for t in gone), "nothing else removed")
+check("100" not in (b.value('mock.persist["MonitoredLights"]') or "").split(","), "deleted light dropped from the saved list")
+check(b.value('mock.listeners["101:1001"]') is None, "its listeners unregistered")
+check("Lamp" in (b.value('mock.props["Last Event"]') or ""), "Last Event names it")
+
+b = project()
+b.run(ITEM_REMOVED + "; fire_delay(3000); fire_delay(5000)")
+check(emptied(b) == [] and b.value('mock.persist["MonitoredLights"]') == "100", "an untracked deletion removes nothing")
+
+b = project()
+b.run("delete_device(100, 101); " + ITEM_REMOVED + "; fire_delay(3000)")
+b.run('mock.devices[100] = { proxies = { [101] = true } }; mock.names[100] = "Lamp"; mock.names[101] = "Lamp"; fire_delay(5000)')
+check(emptied(b) == [] and b.value('mock.persist["MonitoredLights"]') == "100", "back within 5 s (driver update): nothing removed")
+
+b = project()
+b.run("delete_device(100, 101); mock.devices = {}; " + ITEM_REMOVED + "; fire_delay(3000); fire_delay(5000)")
+check(emptied(b) == [] and b.value('mock.persist["MonitoredLights"]') == "100", "empty device list: nothing removed")
+b = project()
+b.run("delete_device(100, 101); mock.devicesFail = true; " + ITEM_REMOVED + "; fire_delay(3000); fire_delay(5000)")
+check(emptied(b) == [] and b.value('mock.persist["MonitoredLights"]') == "100", "device list fails: nothing removed")
+
+b = project()
+b.run("delete_device(100, 101); delete_device(110, 111); delete_device(50, 51); " + ITEM_REMOVED + "; fire_delay(3000); fire_delay(5000)")
+check(emptied(b) == [] and b.value('mock.persist["MonitoredLights"]') == "100", "3 of 5 gone at once: refused, nothing removed")
+
+b = project()
+b.run("mock.names[5] = nil; " + ITEM_REMOVED + "; fire_delay(3000); fire_delay(5000)")
+check(emptied(b) == ["homeassistant/media_player/control4_room_5/config"] and (b.value('mock.persist["MonitoredMediaRooms"]') or "") == "",
+      "deleted media room removed")
+
+b = project()
+b.run("delete_device(720); " + ITEM_REMOVED + "; fire_delay(3000); fire_delay(5000)")
+gone = emptied(b)
+check(GARAGE + "config" in gone and any(t.startswith("homeassistant/sensor/") and "battery" in t for t in gone),
+      "deleted contact sensor: contact and battery sensors removed")
+check("720" not in (b.value('Properties["Contact Sensor Binding Map"]') or "") and (b.value('mock.persist["MonitoredContactSensors"]') or "") == "",
+      "... and dropped from the binding map and the saved list")
+
+b = project()
+b.run("delete_device(100, 101); delete_device(110, 111)")
+b.run(ITEM_REMOVED + "; " + ITEM_REMOVED + "; " + ITEM_REMOVED)
+check(b.value("live_delay(3000)") == 1, "several delete events: one check pending")
+b.run("fire_delay(3000)")
+check(b.value("live_delay(5000)") == 1, "... one confirmation")
+b.run("fire_delay(5000)")
+gone = emptied(b)
+check("homeassistant/light/control4_100/config" in gone and "homeassistant/switch/control4_110/config" in gone,
+      "... which removes both")
+
+b = Bridge(PROJECT)
+b.run("delete_device(100, 101); " + ITEM_REMOVED + "; fire_delay(3000); fire_delay(5000)")
+check(b.value('mock.persist["MonitoredLights"]') == "", "deleted while disconnected: dropped from the list at once")
+b.clear(); b.connect()
+check("homeassistant/light/control4_100/config" in emptied(b), "... and its configs emptied on connecting")
 
 print()
 if failures:

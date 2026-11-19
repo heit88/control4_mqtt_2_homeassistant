@@ -115,6 +115,9 @@ function lightTakes(c)
     end
 end
 function C4:GetDevices() return mock.devices end
+-- A driver's own variables (C4:AddVariable), numbered from 1001 like the proxy's: by device ID
+mock.driverVars = {}
+function C4:GetDeviceVariables(id) return mock.driverVars[id] end
 ''')
 lua.globals().C4.JsonDecode = json_decode
 
@@ -130,6 +133,8 @@ mock.names[200], mock.names[201] = "Kitchen", "Kitchen"
 mock.vars[201] = { [1000] = "1", [1001] = "50", [1002] = "500", [1003] = "750", [1004] = "80", [1005] = "100", [1006] = "10" }
 -- Hue light (Hue Light (Event Stream) driver): device 300, Light V2 proxy 301; only what it supports
 mock.proxies[300] = "301"
+-- Hue Light driver v0.4.6: announces settings changes in its own variable 1001
+mock.driverVars[300] = { ["1001"] = { name = "SETTINGS_CHANGED", value = "0" } }
 mock.names[300], mock.names[301] = "Den Left Lamp", "Den Left Lamp"
 mock.v2["301"] = { name = "Den Left Lamp" }
 mock.vars[301] = { [1000] = "1", [1001] = "55", [1006] = "100",
@@ -196,7 +201,8 @@ def cmds_since(n):
 
 
 def changed(proxy, var, value):
-    """A proxy variable changes: the controller updates it, then calls the listener."""
+    """A proxy variable changes: the controller updates it, then calls the listener. Its state is
+    published within that call (no timer is fired)."""
     mock.vars[proxy][var] = value
     g.OnWatchedVariableChanged(proxy, var, value)
 
@@ -370,6 +376,20 @@ check(published("homeassistant/number/control4_200_preset_level/state") == "70",
 changed(201, 1006, "4")
 check(published("homeassistant/number/control4_200_min_on_level/state") == "4", "V1 1006 change reported as min, not preset")
 
+# --- settings changed in Control4 (Composer, touchscreen) ---
+check(L["300:1001"] and not L["400:1001"], "Hue: its driver's SETTINGS_CHANGED watched; Gen3 driver has none")
+mock.settings[301]["CLICK_RATE_UP"] = "1500"
+n = len(mock.published)
+g.OnWatchedVariableChanged(300, 1001, "1")
+check(published("homeassistant/number/control4_300_click_ramp_rate_up/state") == "1500",
+      "Hue click rate changed in Control4: read again and published")
+check(published("homeassistant/light/control4_300/state") is None or
+      not any(mock.published[i].topic == "homeassistant/light/control4_300/state" for i in range(n + 1, len(mock.published) + 1)),
+      "SETTINGS_CHANGED (driver variable 1001) not taken for a level report (proxy variable 1001)")
+g.UnsubscribeFromDevice(300, "LIGHT")
+check(not L["300:1001"], "unsubscribed: SETTINGS_CHANGED no longer watched")
+g.SubscribeToDevice(300, "LIGHT")
+
 # --- LEDs ---
 g.Properties["Enable LED Color Control"] = "Enabled"
 for dev in (200, 300, 400, 500):
@@ -407,6 +427,73 @@ n = len(mock.published)
 changed(301, 6661, caps.format(c="False", t="True"))
 d = json.loads(published("homeassistant/light/control4_300/config"))
 check(d["supported_color_modes"] == ["color_temp"], "capabilities change (color temperature only): discovery republished")
+n = len(mock.published)
+changed(401, 6661, caps.format(c="False", t="False"))
+check(not any(mock.published[i].topic == "homeassistant/light/control4_400/config" for i in range(n + 1, len(mock.published) + 1)),
+      "capabilities reported again, color unchanged: discovery not republished")
+
+# --- listeners at start-up, whatever the capabilities say then ---
+check(all(L[f"401:{v}"] for v in (1200, 1201, 1202, 6661, 1006)),
+      "Gen3 (no color now): color, capabilities and preset variables watched anyway")
+check(not L["201:1200"] and not L["201:6661"], "V1 dimmer: no Light V2 variables watched")
+# the gen2 Lua dimmer's driver gets SETTINGS_CHANGED after this driver started
+check(not L["500:1005"], "gen2 dimmer without SETTINGS_CHANGED: nothing watched")
+mock.driverVars[500] = lua.table_from({"1005": lua.table_from({"name": "SETTINGS_CHANGED", "value": "0"})})
+changed(501, 6661, mock.vars[501][6661])
+check(L["500:1005"], "capabilities reported: SETTINGS_CHANGED looked up again by name and watched")
+g.OnDriverLateInit()
+# the light's driver adds its variable after this driver has started
+mock.driverVars[400] = lua.table_from({"1010": lua.table_from({"name": "SETTINGS_CHANGED", "value": "0"})})
+check(not L["400:1010"], "start-up: not there yet")
+g.fireTimers(45000)
+check(L["400:1010"], "45 s after start-up: every light's SETTINGS_CHANGED looked up again")
+mock.settings[401]["CLICK_RATE_DOWN"] = "900"
+g.OnWatchedVariableChanged(400, 1010, "1")
+check(published("homeassistant/number/control4_400_click_ramp_rate_down/state") == "900", "and it works")
+
+# --- automatic discovery (connect, Home Assistant restart): cached settings only ---
+def drain():
+    """Fire the paced discovery steps and the connect timers until none are left."""
+    for _ in range(40):
+        for ms in (2000, 2500, 500):
+            g.fireTimers(ms)
+
+
+def published_since(n, topic):
+    return [mock.published[i].msg for i in range(n + 1, len(mock.published) + 1) if mock.published[i].topic == topic]
+
+
+drain()
+g.Properties["Enable LED Color Control"] = "Enabled"
+for dev in (300, 400, 500):
+    g.RefreshLightV2Settings(g.GetProxyID(dev))  # cached, as after a manual run
+g.gLightV2Settings[501] = None  # the gen2 dimmer: never read since start-up
+cached_max = mock.settings[401]["MAX_ON_LEVEL"]
+mock.settings[401]["MAX_ON_LEVEL"] = "95"  # changed on the light; the cache still has the old value
+n, ui = len(mock.published), mock.uiRequests
+g.OnMQTTConnected()
+drain()
+check(mock.uiRequests == ui, f"connect: states and discovery make no SendUIRequest calls ({mock.uiRequests - ui})")
+check(published_since(n, "homeassistant/number/control4_400_preset_level/config")
+      and published_since(n, "homeassistant/text/control4_400_top_on/config")
+      and published_since(n, "homeassistant/number/control4_400_max_on_level/state")[-1] == cached_max != "95",
+      "connect: setting and LED entities with cached settings republished, from the cache")
+check(published_since(n, "homeassistant/light/control4_500/config") and published_since(n, "homeassistant/light/control4_500/state"),
+      "connect: a light with no cached settings still gets its light config and state")
+check(not published_since(n, "homeassistant/number/control4_500_preset_level/config")
+      and not published_since(n, "homeassistant/text/control4_500_top_on/config"),
+      "connect: its setting and LED entities are left as they are (not removed, not read)")
+n, ui = len(mock.published), mock.uiRequests
+g.HandleHomeAssistantStatus("online", False)
+drain()
+check(mock.uiRequests == ui and published_since(n, "homeassistant/light/control4_400/config"),
+      "Home Assistant restart: discovery again, no SendUIRequest calls")
+n, ui = len(mock.published), mock.uiRequests
+g.PublishAllDiscovery()
+drain()
+check(mock.uiRequests > ui and published_since(n, "homeassistant/number/control4_500_preset_level/config")
+      and published_since(n, "homeassistant/number/control4_400_max_on_level/state")[-1] == "95",
+      "Publish Auto-Discovery action: lights read again as before")
 
 print()
 print(f"{len(failures)} failures" if failures else "all passed")

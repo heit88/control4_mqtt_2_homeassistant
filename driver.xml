@@ -3,10 +3,10 @@
   <creator>John Heit</creator>
   <manufacturer>Heit Automation</manufacturer>
   <name>Control4 to Home Assistant Bridge</name>
-  <model>MQTT Bridge v4.7</model>
+  <model>MQTT Bridge v4.10</model>
   <created>01/18/2025 12:00 PM</created>
-  <modified>11/17/2026 12:00 PM</modified>
-  <version>4.7</version>
+  <modified>11/18/2026 6:00 PM</modified>
+  <version>4.10</version>
   <small>devices_sm/c4.gif</small>
   <large>devices_lg/c4.gif</large>
   <control>lua_gen</control>
