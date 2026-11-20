@@ -13,15 +13,82 @@ Updates are event-driven, with no polling. The driver holds an open MQTT connect
 - Contact sensors
 - Media rooms (**experimental**, see [the component README](homeassistant_custom_component/README.md))
 
+## Features
+
+Each Control4 device becomes one Home Assistant device, with the entities below. Entities are named after the device's name in Control4, and keep their entity ID when the device is renamed (topics use the Control4 device ID).
+
+| Control4 device | Home Assistant entities |
+|---|---|
+| Dimmer | Light with brightness and transitions. With **Enable Advanced Dimmer Controls**: number entities for its settings ([table below](#dimmer-entities)). With **Enable LED Color Control**: four text entities for its button LED colors. Power and energy sensors if the dimmer reports them. |
+| Color light (Light V2) | Light with color temperature (Kelvin, limited to the light's own range) and/or full color (`xy`), as the light declares. |
+| Switch (light without a level) | Light that is on or off, or a switch if its ID is in **Switch Device IDs**. LED colors, and power and energy sensors, as for dimmers. |
+| Outlet | One switch per outlet. |
+| Thermostat | Climate entity: modes Off, Heat, Cool and Heat/Cool (two setpoints); fan modes Auto, On and Circulate; current temperature, humidity and what it is doing (heating, cooling, idle). 50-90 °F in 1° steps. With **Enable LED Color Control**: a text entity for its button LED color. |
+| Contact sensor | A door binary sensor per bound input, plus battery level (%), battery voltage (mV) and temperature (°F) sensors when the sensor reports them. |
+| Media room (experimental) | Media player with power, volume and mute, through the custom component. |
+
+### Dimmer entities
+
+All are config entities on the light's device page. A Light V2 light gets only the ones its driver declares (a Hue light gets just its preset and click rates), with the ranges it reports.
+
+| Entity | Unit | Range | Lights |
+|---|---|---|---|
+| Preset Level | % | 0-100 | All dimmers |
+| Min On Level, Max On Level | % | 0-100 | All dimmers |
+| Click Ramp Rate Up / Down | ms | 0-5000 (Light V2: the light's range) | All dimmers |
+| Hold Ramp Rate Up / Down | s | 0-10 in 1 s steps (Light V2: the light's range, in 0.1 s steps) | All dimmers |
+| Auto Off Time | s | 0-65535, 0 = off | Gen3 dimmers |
+| Rocker As Keypad | on/off, read only | | Gen3 dimmers |
+| Top / Bottom LED On / Off | 6-digit hex color, e.g. `0000FF` | | Dimmers and switches with LEDs (**Enable LED Color Control**) |
+| Power | W | | Lights and switches that report it (Gen3) |
+| Energy, Energy Today | Wh | | Lights and switches that report it (Gen3); usable in the Energy dashboard |
+
+Changes go both ways: a value set in Home Assistant is sent to the light, and a value changed in Composer, on a touchscreen or at the light is published to Home Assistant (see [Dimmer settings and LED colors on Light V2 lights](#dimmer-settings-and-led-colors-on-light-v2-lights) for exactly when).
+
 ## Setup
 
 1. Add `mqtt_v2.c4z` to your project in Composer.
 2. Set **MQTT Broker IP**, **MQTT Broker Port**, and **MQTT Username** and **MQTT Password** if your broker uses them.
 3. If some loads should appear as switches rather than lights, list their device IDs in **Switch Device IDs**.
 4. For contact sensors, bind each one to a Contact Sensor Input in Composer and fill in **Contact Sensor Binding Map**.
-5. Run these actions in order: **Connect to MQTT Broker**, **Auto-Discover All Devices**, **Publish Auto-Discovery**.
+5. For media rooms, list the room IDs in **Media Room IDs** and install [the custom component](homeassistant_custom_component/README.md).
+6. Run these actions in order: **Connect to MQTT Broker**, **Auto-Discover All Devices**, **Publish Auto-Discovery**.
 
 Home Assistant needs its MQTT integration connected to the same broker.
+
+### Properties
+
+| Property | What it does |
+|---|---|
+| MQTT Broker IP, MQTT Broker Port | The broker (default port 1883). |
+| MQTT Username, MQTT Password | Leave empty if the broker allows anonymous clients. |
+| Switch Device IDs | Comma-separated device IDs of lights to publish as switches. |
+| Media Room IDs | Comma-separated room IDs to publish as media players. |
+| Contact Sensor Binding Map | `deviceID:binding:name` entries, comma separated, for example `512:300:Front Door,512:301:Back Door`. Bindings are 300-319. |
+| Enable Advanced Dimmer Controls | Dimmer setting entities (on by default). |
+| Enable LED Color Control | Button LED color entities (off by default). |
+| Auto Reconnect | Reconnect when the broker connection is lost (on by default). |
+| Debug Mode | Off, Print, Log, or Print and Log. |
+| Connection Status, Monitored ..., Last Event, Last Command, Last Error, Messages Sent / Received | Read only, for checking the bridge. |
+
+After changing **Enable Advanced Dimmer Controls** or **Enable LED Color Control**, run **Auto-Discover All Devices** and then **Publish Auto-Discovery**.
+
+### Actions
+
+| Action | What it does |
+|---|---|
+| Connect to / Disconnect from MQTT Broker | Opens or closes the broker connection. |
+| Auto-Discover All Devices | Finds lights, switches, outlets and thermostats in the project and starts monitoring them. |
+| Publish Auto-Discovery | Sends every entity's config to Home Assistant, then every state. |
+| Refresh All Device States | Publishes every monitored device's state again. |
+| List All Monitored Devices, Show Connection Info | Writes them to the log. |
+| Cleanup Deleted Devices | Removes devices deleted from the project, from the lists and from Home Assistant. |
+| Remove All Entities | Removes every entity the bridge created from Home Assistant. |
+| Publish Test Message | Publishes to `homeassistant/control4/test`, to check the connection. |
+
+### MQTT topics
+
+Topics follow Home Assistant's discovery layout, `homeassistant/<component>/control4_<deviceID>[_<setting>]/config`, with `/state` and `/set` next to each config. For example, a dimmer with device ID 887 uses `homeassistant/light/control4_887/set` for commands and `homeassistant/number/control4_887_auto_off_time/state` for its auto off time. Configs and states are retained, except media room states. The bridge's own status is `control4/bridge/status` (`online` / `offline`).
 
 ## Outlets
 
@@ -113,7 +180,6 @@ From version 4.10:
 - **Home Assistant only:** topics are fixed, and the discovery prefix must be the default `homeassistant`.
 - **Thermostats:** only tested with an Aprilaire thermostat, and other brands may not work. Modes other than Off, Heat, Cool and Auto show as off in Home Assistant, and every thermostat is labelled "Aprilaire".
 - **Contact sensors:** the driver has 20 contact sensor inputs (bindings 300-319). A sensor shows as unknown if the driver receives a command it doesn't recognize, and stays that way until the sensor next opens or closes.
-- **Changing feature settings:** after changing **Enable LED Color Control** or **Enable Advanced Dimmer Controls**, run **Auto-Discover All Devices** and then **Publish Auto-Discovery**.
 - **Media room playback state (experimental):** play and pause events are treated as toggles, which suits a Roku but can drift on other sources. The Roku automations in `homeassistant_custom_component` use one specific Roku and room, so they need editing for your system.
 - **Light V2 LED colors changed in Control4:** see [Future work](#future-work).
 
