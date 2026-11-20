@@ -77,8 +77,20 @@ end
 -- as a Gen3 dimmer and the gen2 Lua dimmer do on the controller. mock.settings[proxy]: tag -> value,
 -- mock.buttons[proxy]: button ID -> {on, off}, mock.setup[proxy]: extra GET_SETUP tags.
 mock.settings, mock.buttons, mock.setup, mock.caps, mock.uiRequests = {}, {}, {}, {}, 0
+-- A Gen3 light's DEVICE (not its proxy) answers GET_PROPERTIES with auto off, rocker as keypad and
+-- more (as on the controller, 2026-11-19). mock.deviceProps[device]: tag -> value.
+mock.deviceProps, mock.deviceOf = {}, {}
 function C4:SendUIRequest(id, cmd)
     mock.uiRequests = mock.uiRequests + 1
+    if mock.deviceProps[id] then
+        if cmd ~= "GET_PROPERTIES" then return nil end
+        local parts = {}
+        for tag, value in pairs(mock.deviceProps[id]) do
+            table.insert(parts, "<" .. tag .. ">" .. value .. "</" .. tag .. ">")
+        end
+        return "<state><PRESET_LEVEL>100</PRESET_LEVEL><ENERGY_DATA><ENERGY_USED>0</ENERGY_USED></ENERGY_DATA>" ..
+            table.concat(parts) .. "</state>"
+    end
     local settings = mock.settings[id]
     if not settings then return nil end
     local parts = {}
@@ -110,11 +122,25 @@ function lightTakes(c)
     if not s or mock.refuses[c.id] then return end
     local tag = SET_TAGS[c.cmd]
     if tag then s[tag] = tostring(c.params.LEVEL or c.params.RATE) end
+    if c.cmd == "SET_AUTO_OFF" and mock.deviceOf[c.id] then
+        mock.deviceProps[mock.deviceOf[c.id]].AUTO_OFF_TIME = tostring(c.params.TIME)
+    end
     if c.cmd == "SET_BUTTON_COLOR" then
         mock.buttons[c.id][c.params.BUTTON_ID] = { on = c.params.ON_COLOR, off = c.params.OFF_COLOR }
     end
 end
 function C4:GetDevices() return mock.devices end
+-- System events: OnDataToUI watched per device (mock.sysEvents["event:id"])
+C4SystemEvents = { OnItemRemoved = 11, OnDataToUI = 42 }
+mock.sysEvents = {}
+function C4:RegisterSystemEvent(event, id) mock.sysEvents[event .. ":" .. id] = true end
+function C4:UnregisterSystemEvent(event, id) mock.sysEvents[event .. ":" .. id] = nil end
+-- OnDataToUI as the controller raises it (Gen3 adaptive dimmer, 2026-11-19)
+function dataToUI(id, tag, value)
+    OnSystemEvent('<c4soap async="1" name="OnDataToUI" result="0"><param name="iddevice" type="ulong">' .. id ..
+        '</param><param name="data" type="xml"><' .. tag .. '>' .. value .. '</' .. tag ..
+        '></param><param name="time" type="ulong">1795128278</param></c4soap>')
+end
 -- A driver's own variables (C4:AddVariable), numbered from 1001 like the proxy's: by device ID
 mock.driverVars = {}
 function C4:GetDeviceVariables(id) return mock.driverVars[id] end
@@ -163,6 +189,13 @@ mock.setup[401] = "<CLICK_RATE_MIN>250</CLICK_RATE_MIN><CLICK_RATE_MAX>86400000<
 -- Gen3 (its .c4i): min/max, click and hold rates, LEDs; no supports_default_on, yet it has 1006
 mock.caps[401] = "<capabilities><dimmer>True</dimmer><min_max>True</min_max><click_rates>True</click_rates>" ..
     "<hold_rates>True</hold_rates><cold_start>True</cold_start><has_leds>True</has_leds></capabilities>"
+-- Its device: auto off and rocker as keypad (GET_PROPERTIES), power and energy in its own variables
+mock.deviceProps[400] = { AUTO_OFF_TIME = "30", ROCKER_AS_KEYPAD = "False", MAX_WATTS = "4" }
+mock.deviceOf[401] = 400
+mock.driverVars[400] = { ["1000"] = { name = "SHORT_CIRCUIT_DETECTED", value = "False" },
+    ["4570"] = { name = "CURRENT_POWER", value = "12" }, ["4571"] = { name = "ENERGY_USED", value = "1234" },
+    ["4572"] = { name = "ENERGY_USED_TODAY", value = "56" }, ["4567"] = { name = "MINUTES_ON", value = "2" } }
+mock.vars[400] = { [4570] = "12", [4571] = "1234", [4572] = "56" }
 -- Community Lua dimmer (gen2): device 500, Light V2 proxy 501; LEDs driven by the driver itself
 -- (has_leds False) but it has buttons
 mock.proxies[500] = "501"
@@ -389,6 +422,108 @@ check(published("homeassistant/light/control4_300/state") is None or
 g.UnsubscribeFromDevice(300, "LIGHT")
 check(not L["300:1001"], "unsubscribed: SETTINGS_CHANGED no longer watched")
 g.SubscribeToDevice(300, "LIGHT")
+
+# --- Gen3 auto off and rocker as keypad (read from the light's device) ---
+cfg = json.loads(published("homeassistant/number/control4_400_auto_off_time/config"))
+check(cfg["unit_of_measurement"] == "s" and cfg["min"] == 0 and cfg["max"] == 65535 and cfg["step"] == 1,
+      f"Gen3: Auto Off Time number in seconds ({cfg['min']}-{cfg['max']})")
+check(published("homeassistant/number/control4_400_auto_off_time/state") == "30", "Gen3 auto off from the device's GET_PROPERTIES")
+check(published("homeassistant/number/control4_300_auto_off_time/config") == "",
+      "Hue light (device reports no auto off): no Auto Off Time entity")
+check(published("homeassistant/number/control4_200_auto_off_time/config") is None, "V1 dimmer: no Auto Off Time published")
+cfg = json.loads(published("homeassistant/binary_sensor/control4_400_rocker_as_keypad/config"))
+check(cfg["entity_category"] == "diagnostic" and "command_topic" not in cfg, "Gen3: Rocker As Keypad read-only binary sensor")
+check(published("homeassistant/binary_sensor/control4_400_rocker_as_keypad/state") == "OFF", "rocker as keypad state")
+check(published("homeassistant/binary_sensor/control4_300_rocker_as_keypad/config") == "", "Hue light: no Rocker As Keypad")
+c = command(N.format(400, "auto_off_time"), "45.0")
+check(len(c) == 1 and c[0].cmd == "SET_AUTO_OFF" and c[0].id == 401 and c[0].params.TIME == 45
+      and c[0].params.TIME == int(c[0].params.TIME),
+      "auto off from HA: SET_AUTO_OFF to the proxy, whole seconds")
+check(published("homeassistant/number/control4_400_auto_off_time/state") == "45", "auto off shown at once")
+confirm()
+check(published("homeassistant/number/control4_400_auto_off_time/state") == "45", "auto off read back from the device")
+c = command(N.format(400, "auto_off_time"), "65536")
+check(not c, "auto off above 65535 seconds refused")
+c = command(N.format(200, "auto_off_time"), "10")
+check(not c, "V1 dimmer: auto off command ignored")
+# changed in Composer, then read again (preset change)
+mock.deviceProps[400]["ROCKER_AS_KEYPAD"] = "True"
+mock.deviceProps[400]["AUTO_OFF_TIME"] = "0"
+changed(401, 1006, "50")
+check(published("homeassistant/binary_sensor/control4_400_rocker_as_keypad/state") == "ON"
+      and published("homeassistant/number/control4_400_auto_off_time/state") == "0",
+      "device settings read again with the proxy's")
+
+# --- settings changed in Composer: OnDataToUI, live ---
+S = mock.sysEvents
+check(S["42:400"] and S["42:401"] and S["42:301"] and S["42:200"] and S["42:201"],
+      "OnDataToUI watched for every dimmer's device and proxy (V1 too)")
+ui, timers = mock.uiRequests, len(mock.timers)
+g.dataToUI(401, "HOLD_RATE_UP", "5100")
+check(published("homeassistant/number/control4_400_hold_ramp_rate_up/state") == "5.1",
+      "proxy setting changed in Composer (HOLD_RATE_UP): published at once, in seconds")
+g.dataToUI(401, "CLICK_RATE_DOWN", "344")
+check(published("homeassistant/number/control4_400_click_ramp_rate_down/state") == "344", "click rate too")
+g.dataToUI(400, "AUTO_OFF_TIME", "15")
+check(published("homeassistant/number/control4_400_auto_off_time/state") == "15", "device setting (AUTO_OFF_TIME) published at once")
+g.dataToUI(400, "ROCKER_AS_KEYPAD", "False")
+check(published("homeassistant/binary_sensor/control4_400_rocker_as_keypad/state") == "OFF", "rocker as keypad at once")
+check(mock.uiRequests == ui, "no SendUIRequest: the value comes in the event")
+check(len(mock.timers) == timers, "not taken for a project change (no deleted-device check scheduled)")
+g.dataToUI(400, "HOLD_RATE_UP", "9000")
+check(published("homeassistant/number/control4_400_hold_ramp_rate_up/state") == "5.1",
+      "a proxy tag from the device is not taken for the proxy's setting")
+g.dataToUI(301, "HOLD_RATE_UP", "9000")
+check(published("homeassistant/number/control4_300_hold_ramp_rate_up/state") is None,
+      "Hue: a setting it doesn't have stays unpublished")
+g.UnsubscribeFromDevice(400, "LIGHT")
+check(not S["42:400"] and not S["42:401"], "unsubscribed: OnDataToUI no longer watched")
+g.SubscribeToDevice(400, "LIGHT")
+# V1: hold rates (no variable) reported by the dimmer's device, lowercase, in ms. On a change the
+# V1 driver sends its state several times, old and new values interleaved.
+before = published("homeassistant/number/control4_200_hold_ramp_rate_up/state")
+for v in ("5000", "3000", "5000", "3000"):
+    g.dataToUI(200, "hold_ramp_rate_up", v)
+g.dataToUI(200, "hold_ramp_rate_down", "2500")
+check(published("homeassistant/number/control4_200_hold_ramp_rate_up/state") == before,
+      "V1 hold rate burst: nothing published while it settles")
+g.fireTimers(1000)
+check(published("homeassistant/number/control4_200_hold_ramp_rate_up/state") == "3"
+      and published("homeassistant/number/control4_200_hold_ramp_rate_down/state") == "2.5",
+      "V1 hold rates changed in Composer: last value published 1 s after the burst, in seconds")
+g.dataToUI(201, "hold_ramp_rate_up", "9000")
+g.fireTimers(1000)
+check(published("homeassistant/number/control4_200_hold_ramp_rate_up/state") == "3", "V1: only the device's report is taken")
+c = command(N.format(200, "click_ramp_rate_up"), "4000")
+check(not c, "V1: click rate above the reported hold rate (3 s) refused")
+
+# --- power and energy (the light's driver variables, by name) ---
+check(L["400:4570"] and L["400:4571"] and L["400:4572"] and not L["400:4567"],
+      "Gen3: CURRENT_POWER, ENERGY_USED, ENERGY_USED_TODAY watched on the device")
+p = json.loads(published("homeassistant/sensor/control4_400_power/config"))
+e = json.loads(published("homeassistant/sensor/control4_400_energy/config"))
+t = json.loads(published("homeassistant/sensor/control4_400_energy_today/config"))
+check(p["device_class"] == "power" and p["unit_of_measurement"] == "W" and p["state_class"] == "measurement",
+      "power sensor: W, measurement")
+check(e["device_class"] == "energy" and e["unit_of_measurement"] == "Wh" and e["state_class"] == "total_increasing"
+      and t["state_class"] == "total_increasing" and t["unit_of_measurement"] == "Wh",
+      "energy sensors: Wh, total_increasing (Energy dashboard)")
+check(p["device"]["identifiers"] == ["control4_400"], "energy sensors on the light's Home Assistant device")
+check(published("homeassistant/sensor/control4_400_power/state") == "12"
+      and published("homeassistant/sensor/control4_400_energy/state") == "1234"
+      and published("homeassistant/sensor/control4_400_energy_today/state") == "56", "energy states published")
+g.OnWatchedVariableChanged(400, 4570, "7.5")
+check(published("homeassistant/sensor/control4_400_power/state") == "7.5", "power change published at once")
+check(published("homeassistant/sensor/control4_300_power/config") is None
+      and published("homeassistant/sensor/control4_200_power/config") is None, "lights without energy variables: no sensors")
+topics = list(g.DeviceConfigTopics("LIGHT", 400).values())
+check("homeassistant/sensor/control4_400_energy_today/config" in topics
+      and "homeassistant/binary_sensor/control4_400_rocker_as_keypad/config" in topics
+      and "homeassistant/number/control4_400_auto_off_time/config" in topics,
+      "removing the light removes its new entities too")
+g.UnsubscribeFromDevice(400, "LIGHT")
+check(not L["400:4570"], "unsubscribed: energy variables no longer watched")
+g.SubscribeToDevice(400, "LIGHT")
 
 # --- LEDs ---
 g.Properties["Enable LED Color Control"] = "Enabled"

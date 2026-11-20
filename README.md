@@ -64,7 +64,7 @@ Gen3 dimmers, switches and keypad dimmers use Control4's Light V2 proxy (`light_
   - Changing the color of a light that is on doesn't send `ON`, so the light doesn't jump to its Default On level.
   - If a light only reports its capabilities after it is discovered, its Home Assistant entity is published again with them.
 - **Dimmer settings and LEDs:** see the next section. A Gen3 dimmer's settings and top and bottom LED colors are read from the proxy. This was confirmed on a Gen3 dimmer on OS 3.4.3.
-- **Settings changed in Control4:** brightness, state and color changes made in Control4 reach Home Assistant at once. Dimmer settings changed in Composer or on a touchscreen reach it later on a Gen3 dimmer (see [Future work](#future-work)).
+- **Settings changed in Control4:** brightness, state and color changes made in Control4 reach Home Assistant at once. From version 4.11 dimmer settings changed in Composer or on a touchscreen reach it at once too (see the next section).
 
 ## Dimmer settings and LED colors on Light V2 lights
 
@@ -74,9 +74,21 @@ A Light V2 light (Gen3 dimmers, Hue lights, the community Lua dimmers) keeps the
 
 - It shows only the settings and LEDs the light's driver declares in its capabilities (`click_rates`, `hold_rates`, `min_max`, `supports_default_on`, `has_leds` or `has_button_events`), with the click and hold rate ranges the light reports. The proxy itself reports every setting and three buttons for any light, so a Hue light gets just its preset and click rates.
 - Changes from Home Assistant go to the proxy (`SET_PRESET_LEVEL`, `SET_HOLD_RATE_UP`, `SET_BUTTON_COLOR`, ...), and the settings are read back 3 seconds later, so a value the light refused is put back.
-- Settings are read again on connect, when a light is discovered, and whenever its Default On preset changes. The proxy announces nothing when another setting is changed in Composer or on a touchscreen, so a light driver can announce it instead: from version 4.8 the driver watches a driver variable named `SETTINGS_CHANGED` on the light's own driver, and reads the settings again whenever it changes. The Hue Light driver has it from v0.4.6, and the community gen2 Lua dimmers and switches from v20. For lights without it (Gen3 dimmers), such a change reaches Home Assistant at the next of the reads above.
+- Settings are read again on connect, when a light is discovered, and whenever its Default On preset changes. The proxy announces nothing when another setting is changed in Composer or on a touchscreen, so a light driver can announce it instead: from version 4.8 the driver watches a driver variable named `SETTINGS_CHANGED` on the light's own driver, and reads the settings again whenever it changes. The Hue Light driver has it from v0.4.6, and the community gen2 Lua dimmers and switches from v20. For lights without it (Gen3 dimmers), see the next point.
+- From version 4.11 the driver also watches the `OnDataToUI` system event for each Light V2 light's device and proxy. The controller raises it when a setting is changed in Composer or on a touchscreen, with the new value (for example `<HOLD_RATE_UP>5100</HOLD_RATE_UP>` from the proxy, or `<AUTO_OFF_TIME>30</AUTO_OFF_TIME>` from a Gen3 dimmer's device), so the change is published at once with no read and no polling. This was confirmed on a Gen3 adaptive dimmer. Only settings the light was found to have are taken, and LED color changes made in Composer are not covered yet.
+- V1 dimmers have no variable for their hold rates, so before 4.11 a hold rate was shown only once set from Home Assistant. Their device reports them in `OnDataToUI` too (`<hold_ramp_rate_up>3000</hold_ramp_rate_up>`, in ms), so from 4.11 a hold rate changed in Composer is shown. On a change the V1 driver sends its whole state several times, with old and new values interleaved, so the last value is published 1 second after the burst. A hold rate nobody has changed since the bridge started is still not shown.
 
 V1 lights work as before.
+
+## Gen3 auto off, keypad mode and energy
+
+From version 4.11. A Gen3 dimmer's driver device (not its Light V2 proxy) answers `GET_PROPERTIES` with settings the proxy doesn't have, and keeps power and energy in variables of its own. This was confirmed on a Gen3 adaptive dimmer on 2026-11-19.
+
+- **Auto Off Time** (with **Enable Advanced Dimmer Controls**): a number entity in seconds (0 to 65535, the dimmer's limit), 0 = auto off disabled. It is read from the device's `AUTO_OFF_TIME`, set with `SET_AUTO_OFF` (`TIME` in whole seconds) sent to the Light V2 proxy, and read back 3 seconds later like the other settings. It is shown only for lights whose device reports it.
+- **Rocker As Keypad** (with **Enable Advanced Dimmer Controls**): a read-only binary sensor, from the device's `ROCKER_AS_KEYPAD`. No command that changes it was found (`SET_ROCKER_AS_KEYPAD` and similar were tried on the device and the proxy), so change it in Composer.
+- Both are read whenever the dimmer's other settings are, and a change made in Composer reaches Home Assistant at once (`OnDataToUI`, above).
+- **Power, Energy, Energy Today:** sensors for any monitored light or switch whose driver has variables named `CURRENT_POWER` (W), `ENERGY_USED` and `ENERGY_USED_TODAY` (Wh). They are found by name and published as they change. Power is a `measurement`, and both energy sensors are `total_increasing`, so they can be added to Home Assistant's Energy dashboard (Energy Today resets daily, which `total_increasing` allows). These don't depend on any driver property.
+- "Turn on to previous level" is not exposed. It is not in `GET_PROPERTIES`, and it can't be followed with `OnDataToUI`: the device sometimes sends it (`PREVIOUS_ON_LEVEL_ENABLED`) in a burst with its firmware version and other status, but the value was the one from before the change, and toggling it again raised no event at all. No command to change it is known.
 
 ## Availability and Home Assistant restarts
 
@@ -103,23 +115,11 @@ From version 4.10:
 - **Contact sensors:** the driver has 20 contact sensor inputs (bindings 300-319). A sensor shows as unknown if the driver receives a command it doesn't recognize, and stays that way until the sensor next opens or closes.
 - **Changing feature settings:** after changing **Enable LED Color Control** or **Enable Advanced Dimmer Controls**, run **Auto-Discover All Devices** and then **Publish Auto-Discovery**.
 - **Media room playback state (experimental):** play and pause events are treated as toggles, which suits a Roku but can drift on other sources. The Roku automations in `homeassistant_custom_component` use one specific Roku and room, so they need editing for your system.
-- **Light V2 settings changed in Control4:** see [Future work](#future-work).
+- **Light V2 LED colors changed in Control4:** see [Future work](#future-work).
 
 ## Future work
 
-**Light V2 settings changed in Control4 reach Home Assistant late.** A V1 light keeps its dimmer settings (click and hold rates, preset, min/max on level) in proxy variables, which the driver watches, so a change made in Composer or on a touchscreen is published at once. A Light V2 proxy keeps them internally and changes no variable (only the Default On preset, 1006, is one), so the driver only sees such a change at its next read: on connect, on discovery, when the preset changes, or 3 seconds after a change from Home Assistant. A light driver can announce the change with a `SETTINGS_CHANGED` variable (above), but only if we can change that driver.
-
-| Light | Driver | Live updates |
-|---|---|---|
-| Hue Light | ours | yes, from v0.4.6 |
-| Community gen2 Lua dimmers and switches | ours | yes, from v20 |
-| Gen3 dimmers | Control4's | no: the driver can't be changed |
-
-To investigate for Gen3, without polling:
-
-- whether the Light V2 proxy sends any notification, event or Director message another driver can subscribe to when a setting changes (watch `OnDeviceEvent` and `OnWatchedVariableChanged` on the proxy and on the Gen3 driver device while changing a click rate in Composer);
-- whether the Gen3 driver device has variables of its own that follow the settings (`C4:GetDeviceVariables` on the driver device, not the proxy);
-- whether any variable the driver already watches changes alongside the setting, so it can be used as the trigger to read the proxy again.
+**Light V2 LED colors changed in Control4 may reach Home Assistant late.** Dimmer settings changed in Composer or on a touchscreen are published at once (`OnDataToUI`, from version 4.11, and `SETTINGS_CHANGED` for the Hue and community Lua drivers). Whether a button LED color change raises `OnDataToUI`, and in what form, is not known yet. Until then such a change is seen at the next read: on connect, on discovery, when the preset changes, or 3 seconds after a change from Home Assistant.
 
 ## Tests
 

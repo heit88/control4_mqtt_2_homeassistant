@@ -2,12 +2,12 @@
 -- Author: John Heit
 -- Copyright 2025 Heit Automation
 -- Licensed under the MIT License, see the LICENSE file
--- Version 4.10 - Native C4 Network Stack (Event-Driven), Light V2 color lights, all outlet driver generations,
+-- Version 4.11 - Native C4 Network Stack (Event-Driven), Light V2 color lights, all outlet driver generations,
 -- bridge availability (MQTT Will), automatic discovery on Home Assistant restart, devices deleted from the
--- project removed from Home Assistant
+-- project removed from Home Assistant, Gen3 auto off and power / energy sensors
 
 -- Constants
-local DRIVER_VERSION = "4.10"  -- keep in step with <version> in driver.xml
+local DRIVER_VERSION = "4.11"  -- keep in step with <version> in driver.xml
 local MQTT_BINDING_ID = 6001  -- Network binding ID for MQTT broker connection
 
 -- Bridge availability: the broker publishes "offline" here (the MQTT Will) when the connection to the
@@ -483,11 +483,20 @@ function OnDriverLateInit()
     gRescanTimer = C4:SetTimer(TIMER_INTERVALS.SETTINGS_CHANGED_RESCAN, function()
         gRescanTimer = nil
         local ok, err = pcall(function()
+            -- Its power / energy variables likewise: sensors found only now are published
+            local function rescan(deviceID)
+                ResolveSettingsChangedVariable(deviceID)
+                local had = gEnergyVars[tonumber(deviceID)] ~= nil
+                ResolveEnergyVariables(deviceID)
+                if not had and gEnergyVars[tonumber(deviceID)] and gMQTTConnected then
+                    PublishEnergyDiscovery(deviceID)
+                end
+            end
             for _, lightID in ipairs(gMonitoredLights) do
-                ResolveSettingsChangedVariable(lightID)
+                rescan(lightID)
             end
             for _, switchID in ipairs(gMonitoredSwitches) do
-                ResolveSettingsChangedVariable(switchID)
+                rescan(switchID)
             end
         end)
         if not ok then
@@ -1105,7 +1114,17 @@ local DIMMER_CONTROL_VARS = {
     click_ramp_rate_up = {v1 = VARIABLE_IDS.CLICK_RAMP_RATE_UP, tag = "CLICK_RATE_UP", command = "SET_CLICK_RATE_UP", param = "RATE", range = "CLICK_RATE", capability = "click_rates"},
     click_ramp_rate_down = {v1 = VARIABLE_IDS.CLICK_RAMP_RATE_DOWN, tag = "CLICK_RATE_DOWN", command = "SET_CLICK_RATE_DOWN", param = "RATE", range = "CLICK_RATE", capability = "click_rates"},
     hold_ramp_rate_up = {tag = "HOLD_RATE_UP", command = "SET_HOLD_RATE_UP", param = "RATE", seconds = true, range = "HOLD_RATE", capability = "hold_rates"},
-    hold_ramp_rate_down = {tag = "HOLD_RATE_DOWN", command = "SET_HOLD_RATE_DOWN", param = "RATE", seconds = true, range = "HOLD_RATE", capability = "hold_rates"}
+    hold_ramp_rate_down = {tag = "HOLD_RATE_DOWN", command = "SET_HOLD_RATE_DOWN", param = "RATE", seconds = true, range = "HOLD_RATE", capability = "hold_rates"},
+    -- Gen3 auto off (seconds, 0 = off): only the light's device reports it (GET_PROPERTIES to the
+    -- device, not the proxy); SET_AUTO_OFF works sent to either (confirmed on a Gen3 adaptive
+    -- dimmer, 2026-11-19). Light V2 only.
+    auto_off_time = {device_tag = "AUTO_OFF_TIME", command = "SET_AUTO_OFF", param = "TIME", integer = true, v2only = true}
+}
+
+-- Gen3 device settings shown read-only (no command found that changes them): suffix -> tag in the
+-- device's GET_PROPERTIES. Published as binary sensors.
+local DEVICE_FLAG_SETTINGS = {
+    rocker_as_keypad = {tag = "ROCKER_AS_KEYPAD", name = "Rocker As Keypad", icon = "mdi:gesture-tap-button"}
 }
 
 -- Light V2 settings and button LED colors as the proxy last answered, by proxy ID:
@@ -1157,13 +1176,33 @@ function RefreshLightV2Settings(proxyID)
     local okSetup, setup = pcall(C4.SendUIRequest, C4, proxyID, "GET_SETUP", {})
     local okCaps, caps = pcall(C4.SendUIRequest, C4, proxyID, "GET_CAPABILITIES", {})
     caps = (okCaps and type(caps) == "string") and caps or ""
-    local settings = { values = {}, leds = {}, setup = (okSetup and type(setup) == "string") and setup or "" }
+    local settings = { values = {}, leds = {}, flags = {}, setup = (okSetup and type(setup) == "string") and setup or "" }
+    -- A Gen3 light's device answers GET_PROPERTIES with settings its proxy doesn't have (auto off,
+    -- rocker as keypad). Other light drivers answer nothing.
+    local deviceID = GetDeviceLookup().lightProxy[proxyID]
+    local deviceXml = ""
+    if deviceID and deviceID ~= proxyID then
+        local okDevice, answer = pcall(C4.SendUIRequest, C4, deviceID, "GET_PROPERTIES", {})
+        deviceXml = (okDevice and type(answer) == "string") and answer or ""
+    end
+    for suffix, flag in pairs(DEVICE_FLAG_SETTINGS) do
+        local value = xmlTag(deviceXml, flag.tag)
+        if value and value ~= "" then
+            settings.flags[suffix] = (value == "True" or value == "true" or value == "1")
+        end
+    end
     for suffix, control in pairs(DIMMER_CONTROL_VARS) do
-        local value = xmlTag(xml, control.tag)
-        -- The Default On preset also counts when the proxy has its variable: a Gen3 dimmer has
-        -- 1006 without declaring supports_default_on
-        local has = lightV2Has(caps, control.capability) or
-            (control.v2 ~= nil and C4:GetDeviceVariable(proxyID, control.v2) ~= nil)
+        local value, has
+        if control.device_tag then
+            -- Reported by the device: it has the setting if the tag is there
+            value, has = xmlTag(deviceXml, control.device_tag), true
+        else
+            value = xmlTag(xml, control.tag)
+            -- The Default On preset also counts when the proxy has its variable: a Gen3 dimmer has
+            -- 1006 without declaring supports_default_on
+            has = lightV2Has(caps, control.capability) or
+                (control.v2 ~= nil and C4:GetDeviceVariable(proxyID, control.v2) ~= nil)
+        end
         if has and value and value ~= "" then
             settings.values[suffix] = value
         end
@@ -1241,7 +1280,8 @@ end
 local DIMMER_CONTROL_DEFAULT_RANGES = {
     min_on_level = {0, 100}, max_on_level = {0, 100}, preset_level = {0, 100},
     click_ramp_rate_up = {0, 5000}, click_ramp_rate_down = {0, 5000},
-    hold_ramp_rate_up = {0, 10}, hold_ramp_rate_down = {0, 10}
+    hold_ramp_rate_up = {0, 10}, hold_ramp_rate_down = {0, 10},
+    auto_off_time = {0, 65535}  -- seconds (the dimmer's limit, 16 bits)
 }
 function GetDimmerControlRange(proxyID, suffix)
     local default = DIMMER_CONTROL_DEFAULT_RANGES[suffix] or {0, 100}
@@ -1336,11 +1376,12 @@ function GetDimmerControlValue(deviceID, proxyID, suffix)
     if IsLightV2(proxyID) then
         return nil
     end
-    local rates = gHoldRampRates[deviceID]
+    -- V1 hold rates (seconds): set from Home Assistant, or reported by the dimmer (OnDataToUI)
+    local rates = gHoldRampRates[tonumber(deviceID)]
     if suffix == "hold_ramp_rate_up" and rates and rates.up then
-        return tostring(rates.up)
+        return string.format("%g", rates.up)
     elseif suffix == "hold_ramp_rate_down" and rates and rates.down then
-        return tostring(rates.down)
+        return string.format("%g", rates.down)
     end
     return nil
 end
@@ -1550,9 +1591,11 @@ function SubscribeToDevice(deviceID, deviceType)
             C4:RegisterVariableListener(proxyID, VARIABLE_IDS.V2_PRESET_LEVEL)
         end
 
-        -- Light V2 lights whose driver announces settings changes (see SETTINGS_CHANGED_VAR)
+        -- Light V2 lights whose driver announces settings changes (see SETTINGS_CHANGED_VAR), and
+        -- power / energy the light's driver reports (see ENERGY_SENSORS)
         if deviceType == "LIGHT" or deviceType == "SWITCH" then
             ResolveSettingsChangedVariable(deviceID)
+            ResolveEnergyVariables(deviceID)
         end
 
         -- Also register for LED color variables on the device itself (if LED control enabled)
@@ -1575,6 +1618,9 @@ function SubscribeToDevice(deviceID, deviceType)
                 for _, varID in ipairs(GetDimmerControlVariables(proxyID)) do
                     C4:RegisterVariableListener(proxyID, varID)
                 end
+                -- Settings changed in Control4 that no variable shows (Light V2 settings, V1 hold
+                -- rates): the OnDataToUI system event
+                WatchLightSettingsEvents(deviceID)
             end
         end
     elseif deviceType == "THERMOSTAT" then
@@ -1622,10 +1668,14 @@ function UnsubscribeFromDevice(deviceID, deviceType)
             end
             C4:UnregisterVariableListener(proxyID, VARIABLE_IDS.V2_PRESET_LEVEL)
         end
+        UnwatchLightSettingsEvents(deviceID)
 
         if gSettingsChangedVars[deviceID] then
             C4:UnregisterVariableListener(deviceID, gSettingsChangedVars[deviceID])
             gSettingsChangedVars[deviceID] = nil
+        end
+        if deviceType == "LIGHT" or deviceType == "SWITCH" then
+            UnwatchEnergyVariables(deviceID)
         end
 
         -- Also unregister LED variables from device (only for lights and switches, not outlets)
@@ -3177,6 +3227,14 @@ function HandleWatchedVariableChanged(idDevice, idVariable, strValue)
         return
     end
 
+    -- Power / energy a light's or switch's driver reports in its own variables
+    if changedDevice and gEnergyVars[changedDevice] and gEnergyVars[changedDevice][tonumber(idVariable)] then
+        if gMQTTConnected then
+            PublishEnergyState(changedDevice, idVariable, strValue)
+        end
+        return
+    end
+
     -- Determine the actual device ID we store in our lists
     local actualDeviceID = idDevice
     local deviceName = C4:GetDeviceDisplayName(idDevice) or "Unknown"
@@ -3729,7 +3787,9 @@ function PublishLightDiscovery(lightID)
     gLightColorCapsSig[tonumber(lightID)] = LightDiscoverySignature(proxyID)
 
     -- Use QoS 1 for reliable discovery message delivery
-    return PublishMQTT(discoveryTopic, payload, 1, true)
+    local ok = PublishMQTT(discoveryTopic, payload, 1, true)
+    PublishEnergyDiscovery(lightID)
+    return ok
 end
 
 -- What a light's discovery config depends on: dimmer or not, and its color capabilities
@@ -3801,7 +3861,9 @@ function PublishSwitchDiscovery(switchID)
     local payload = EncodeJSON(AddAvailability(config))
     Log("Publishing switch discovery: " .. switchName)
 
-    return PublishMQTT(discoveryTopic, payload, 1, true)
+    local ok = PublishMQTT(discoveryTopic, payload, 1, true)
+    PublishEnergyDiscovery(switchID)
+    return ok
 end
 
 -- Outlet State Publishing
@@ -4107,13 +4169,23 @@ function PublishDimmerAdvancedControlDiscovery(deviceID)
             max = 10,
             unit = "s",
             icon = "mdi:arrow-down-thick"
+        },
+        {
+            suffix = "auto_off_time",
+            name = "Auto Off Time",
+            varID = nil,  -- Gen3: read from the device, in seconds (0 = auto off disabled)
+            min = 0,
+            max = 65535,
+            unit = "s",
+            icon = "mdi:timer-off-outline"
         }
     }
 
     -- A Light V2 light has only the settings its proxy reports (a Hue light has no hold rates or
     -- min/max): remove any entity published for the others before. Its limits come from the proxy.
     if IsLightV2(proxyID) then
-        if not RefreshLightV2Settings(proxyID) and gSettingsCacheOnly then
+        local settings = RefreshLightV2Settings(proxyID)
+        if not settings and gSettingsCacheOnly then
             return false  -- not read yet (automatic run): leave its setting entities as they are
         end
         local available = {}
@@ -4125,6 +4197,16 @@ function PublishDimmerAdvancedControlDiscovery(deviceID)
             end
         end
         controls = available
+        PublishDeviceFlagDiscovery(deviceID, dimmerName, settings)
+    else
+        -- V1 dimmers: every control but the Light V2 only ones
+        local v1Controls = {}
+        for _, control in ipairs(controls) do
+            if not DIMMER_CONTROL_VARS[control.suffix].v2only then
+                table.insert(v1Controls, control)
+            end
+        end
+        controls = v1Controls
     end
 
     -- Publish discovery for each control
@@ -4142,7 +4224,7 @@ function PublishDimmerAdvancedControlDiscovery(deviceID)
             command_topic = "homeassistant/number/control4_" .. deviceID .. "_" .. control.suffix .. "/set",
             min = low,
             max = high,
-            step = (control.unit == "s" and IsLightV2(proxyID)) and 0.1 or 1,  -- Light V2 hold rates are in ms
+            step = (DIMMER_CONTROL_VARS[control.suffix].seconds and IsLightV2(proxyID)) and 0.1 or 1,  -- Light V2 hold rates are in ms
             mode = "box",
             unit_of_measurement = control.unit,
             icon = control.icon,
@@ -4208,7 +4290,138 @@ function PublishDimmerAdvancedControlStates(deviceID)
         end
     end
 
+    -- Gen3 device settings shown read-only (Light V2, as last read)
+    local settings = IsLightV2(proxyID) and GetLightV2Settings(proxyID)
+    for suffix in pairs(DEVICE_FLAG_SETTINGS) do
+        local on = settings and settings.flags and settings.flags[suffix]
+        if on ~= nil then
+            PublishMQTT("homeassistant/binary_sensor/control4_" .. deviceID .. "_" .. suffix .. "/state", on and "ON" or "OFF", 1, true)
+        end
+    end
+
     return true
+end
+
+-- Read-only Gen3 device settings (binary sensors), for those the light's device reports; any
+-- published before that it no longer reports are removed. settings: its cached Light V2 settings.
+function PublishDeviceFlagDiscovery(deviceID, dimmerName, settings)
+    for suffix, flag in pairs(DEVICE_FLAG_SETTINGS) do
+        local topic = "homeassistant/binary_sensor/control4_" .. deviceID .. "_" .. suffix .. "/config"
+        if settings and settings.flags and settings.flags[suffix] ~= nil then
+            local objectID = SanitizeEntityName(dimmerName .. " " .. flag.name)
+            local config = {
+                name = dimmerName .. " - " .. flag.name,
+                object_id = objectID,
+                default_entity_id = DefaultEntityID("binary_sensor", objectID, deviceID),
+                unique_id = "control4_" .. deviceID .. "_" .. suffix,
+                state_topic = "homeassistant/binary_sensor/control4_" .. deviceID .. "_" .. suffix .. "/state",
+                payload_on = "ON",
+                payload_off = "OFF",
+                icon = flag.icon,
+                entity_category = "diagnostic",
+                device = {
+                    identifiers = {"control4_" .. deviceID},
+                    name = dimmerName,
+                    manufacturer = "Control4",
+                    model = "Dimmer"
+                }
+            }
+            PublishMQTT(topic, EncodeJSON(AddAvailability(config)), 1, true)
+        else
+            PublishMQTT(topic, "", 1, true)
+        end
+    end
+end
+
+-- Power and energy a light, switch or outlet driver reports in its own variables (a Gen3 dimmer:
+-- CURRENT_POWER, ENERGY_USED, ENERGY_USED_TODAY, in W and Wh, confirmed 2026-11-19). Found by name,
+-- as the controller numbers a driver's own variables itself. Published as sensors Home Assistant's
+-- Energy dashboard takes: the day's total resets at midnight, which total_increasing allows.
+ENERGY_SENSORS = {
+    {suffix = "power", variable = "CURRENT_POWER", name = "Power", device_class = "power", unit = "W", state_class = "measurement"},
+    {suffix = "energy", variable = "ENERGY_USED", name = "Energy", device_class = "energy", unit = "Wh", state_class = "total_increasing"},
+    {suffix = "energy_today", variable = "ENERGY_USED_TODAY", name = "Energy Today", device_class = "energy", unit = "Wh", state_class = "total_increasing"}
+}
+-- Watched energy variables by device ID: [deviceID] = {[varID] = sensor}
+gEnergyVars = {}
+
+function EnergySensorTopic(deviceID, suffix)
+    return "homeassistant/sensor/control4_" .. deviceID .. "_" .. suffix
+end
+
+-- Look up (by name) a device's energy variables and watch them
+function ResolveEnergyVariables(deviceID)
+    deviceID = tonumber(deviceID)
+    if not deviceID then
+        return
+    end
+    UnwatchEnergyVariables(deviceID)
+    local byName = {}
+    for _, sensor in ipairs(ENERGY_SENSORS) do
+        byName[sensor.variable] = sensor
+    end
+    local found = {}
+    local any = false
+    for varID, var in pairs(C4:GetDeviceVariables(deviceID) or {}) do
+        local sensor = type(var) == "table" and byName[var.name]
+        if sensor and tonumber(varID) then
+            found[tonumber(varID)] = sensor
+            C4:RegisterVariableListener(deviceID, tonumber(varID))
+            any = true
+        end
+    end
+    gEnergyVars[deviceID] = any and found or nil
+end
+
+function UnwatchEnergyVariables(deviceID)
+    deviceID = tonumber(deviceID)
+    for varID in pairs(gEnergyVars[deviceID] or {}) do
+        C4:UnregisterVariableListener(deviceID, varID)
+    end
+    gEnergyVars[deviceID] = nil
+end
+
+-- Discovery for a device's power and energy sensors (those it has), then their states
+function PublishEnergyDiscovery(deviceID)
+    local vars = gEnergyVars[tonumber(deviceID)]
+    if not vars then
+        return
+    end
+    local name = C4:GetDeviceDisplayName(GetProxyID(deviceID)) or C4:GetDeviceDisplayName(deviceID) or ("Device " .. deviceID)
+    for _, sensor in pairs(vars) do
+        local objectID = SanitizeEntityName(name .. " " .. sensor.name)
+        local config = {
+            name = name .. " - " .. sensor.name,
+            object_id = objectID,
+            default_entity_id = DefaultEntityID("sensor", objectID, deviceID),
+            unique_id = "control4_" .. deviceID .. "_" .. sensor.suffix,
+            state_topic = EnergySensorTopic(deviceID, sensor.suffix) .. "/state",
+            device_class = sensor.device_class,
+            state_class = sensor.state_class,
+            unit_of_measurement = sensor.unit,
+            device = {
+                identifiers = {"control4_" .. deviceID},
+                name = name,
+                manufacturer = "Control4"
+            }
+        }
+        PublishMQTT(EnergySensorTopic(deviceID, sensor.suffix) .. "/config", EncodeJSON(AddAvailability(config)), 1, true)
+    end
+    PublishEnergyStates(deviceID)
+end
+
+function PublishEnergyState(deviceID, varID, value)
+    local sensor = gEnergyVars[tonumber(deviceID)] and gEnergyVars[tonumber(deviceID)][tonumber(varID)]
+    value = tonumber(value)
+    if sensor and value then
+        PublishMQTT(EnergySensorTopic(deviceID, sensor.suffix) .. "/state", tostring(value), 0, true)
+    end
+end
+
+function PublishEnergyStates(deviceID)
+    for varID in pairs(gEnergyVars[tonumber(deviceID)] or {}) do
+        PublishEnergyState(deviceID, varID, C4:GetDeviceVariable(deviceID, varID))
+    end
 end
 
 -- Paced discovery for every monitored device (one device per DISCOVERY_DELAY). auto: run by the
@@ -4399,16 +4612,27 @@ function DeviceConfigTopics(deviceType, deviceID)
             add("homeassistant/text/control4_" .. deviceID .. "_" .. suffix .. "/config")
         end
     end
+    local function addEnergySensors()
+        for _, sensor in ipairs(ENERGY_SENSORS) do
+            add(EnergySensorTopic(deviceID, sensor.suffix) .. "/config")
+        end
+    end
     if deviceType == "LIGHT" then
         add("homeassistant/light/control4_" .. deviceID .. "/config")
         addLEDTexts()
         for _, suffix in ipairs({"min_on_level", "max_on_level", "preset_level", "click_ramp_rate_up",
-                                 "click_ramp_rate_down", "hold_ramp_rate_up", "hold_ramp_rate_down"}) do
+                                 "click_ramp_rate_down", "hold_ramp_rate_up", "hold_ramp_rate_down",
+                                 "auto_off_time"}) do
             add("homeassistant/number/control4_" .. deviceID .. "_" .. suffix .. "/config")
         end
+        for suffix in pairs(DEVICE_FLAG_SETTINGS) do
+            add("homeassistant/binary_sensor/control4_" .. deviceID .. "_" .. suffix .. "/config")
+        end
+        addEnergySensors()
     elseif deviceType == "SWITCH" then
         add("homeassistant/switch/control4_" .. deviceID .. "/config")
         addLEDTexts()
+        addEnergySensors()
     elseif deviceType == "OUTLET" then
         add("homeassistant/switch/control4_" .. deviceID .. "/config")
     elseif deviceType == "THERMOSTAT" then
@@ -4996,7 +5220,8 @@ function HandleMQTTCommand(topic, payload)
             click_ramp_rate_up = {varID = VARIABLE_IDS.CLICK_RAMP_RATE_UP, min = 0, max = 5000, name = "Click Ramp Rate Up", unit = "ms"},
             click_ramp_rate_down = {varID = VARIABLE_IDS.CLICK_RAMP_RATE_DOWN, min = 0, max = 5000, name = "Click Ramp Rate Down", unit = "ms"},
             hold_ramp_rate_up = {varID = nil, min = 0, max = 10, name = "Hold Ramp Rate Up", unit = "s"},
-            hold_ramp_rate_down = {varID = nil, min = 0, max = 10, name = "Hold Ramp Rate Down", unit = "s"}
+            hold_ramp_rate_down = {varID = nil, min = 0, max = 10, name = "Hold Ramp Rate Down", unit = "s"},
+            auto_off_time = {varID = nil, min = 0, max = 65535, name = "Auto Off Time", unit = "s"}
         }
 
         local control = controlMap[controlSuffix]
@@ -5006,6 +5231,10 @@ function HandleMQTTCommand(topic, payload)
         end
 
         local proxyID = GetProxyID(dimmerID)
+        if DIMMER_CONTROL_VARS[controlSuffix].v2only and not IsLightV2(proxyID) then
+            LogError(control.name .. " is not supported by dimmer " .. dimmerID)
+            return
+        end
         local dimmerName = C4:GetDeviceDisplayName(proxyID)
         control.min, control.max = GetDimmerControlRange(proxyID, controlSuffix)
 
@@ -5135,7 +5364,13 @@ function HandleMQTTCommand(topic, payload)
             -- time (a Zigbee dimmer after the device confirms), so read the settings back once
             -- shortly after: Home Assistant shows what the light actually took.
             local spec = DIMMER_CONTROL_VARS[controlSuffix]
-            local setting = spec.seconds and math.floor(value * 1000 + 0.5) or value
+            local setting = value
+            if spec.seconds then
+                setting = math.floor(value * 1000 + 0.5)
+            elseif spec.integer then
+                setting = math.floor(value + 0.5)
+                value = setting
+            end
             C4:SendToDevice(proxyID, spec.command, {[spec.param] = setting})
             ConfirmLightV2Settings(dimmerID)
         elseif control.varID == VARIABLE_IDS.CLICK_RAMP_RATE_UP then
@@ -5558,6 +5793,12 @@ end
 
 function HandleSystemEvent(event)
     local raw = tostring(event)
+    -- A Light V2 light's setting changed (watched per light, see WatchLightSettingsEvents): not a
+    -- project change, and frequent (each step of a slider in Composer)
+    if string.find(raw, 'name="OnDataToUI"', 1, true) then
+        HandleDataToUI(raw)
+        return
+    end
     -- The payload format isn't documented: show it (always in debug mode, once per load regardless)
     local line = "System event (raw): " .. string.sub(raw, 1, 500)
     if not gSystemEventRawLogged then
@@ -5573,6 +5814,140 @@ function HandleSystemEvent(event)
         or string.match(raw, "<devid>(%d+)</devid>") or string.match(raw, "<id>(%d+)</id>")
     Log("System event " .. name .. (id and (": item " .. id) or "") .. " - checking monitored devices in 3 s")
     ScheduleDeletedDeviceCheck()
+end
+
+-- Live Light V2 settings. A Light V2 proxy changes no variable when a setting is changed in
+-- Composer or on a touchscreen, but the controller raises the OnDataToUI system event for it, from
+-- the proxy (CLICK_RATE_UP, HOLD_RATE_DOWN, ...) and from a Gen3 light's device (AUTO_OFF_TIME, ...),
+-- with the new value (confirmed on a Gen3 adaptive dimmer, 2026-11-19):
+--   <c4soap name="OnDataToUI"><param name="iddevice">888</param><param name="data" type="xml">
+--   <HOLD_RATE_UP>5100</HOLD_RATE_UP></param>...</c4soap>
+-- Watched for each monitored Light V2 light's device and proxy: [watched ID] = light's device ID
+gDataToUIIds = {}
+
+function OnDataToUIEventID()
+    return C4SystemEvents and C4SystemEvents.OnDataToUI
+end
+
+function WatchLightSettingsEvents(deviceID)
+    deviceID = tonumber(deviceID)
+    local eventID = OnDataToUIEventID()
+    if not (deviceID and eventID and C4.RegisterSystemEvent) then
+        return
+    end
+    for _, id in ipairs({deviceID, tonumber(GetProxyID(deviceID))}) do
+        if id and not gDataToUIIds[id] then
+            local ok = pcall(function() C4:RegisterSystemEvent(eventID, id) end)
+            if ok then
+                gDataToUIIds[id] = deviceID
+            end
+        end
+    end
+end
+
+function UnwatchLightSettingsEvents(deviceID)
+    deviceID = tonumber(deviceID)
+    local eventID = OnDataToUIEventID()
+    for id, owner in pairs(gDataToUIIds) do
+        if owner == deviceID then
+            if eventID and C4.UnregisterSystemEvent then
+                pcall(function() C4:UnregisterSystemEvent(eventID, id) end)
+            end
+            gDataToUIIds[id] = nil
+        end
+    end
+    if deviceID and gV1HoldRateTimers[deviceID] then
+        CancelTimerObject(gV1HoldRateTimers[deviceID])
+        gV1HoldRateTimers[deviceID] = nil
+    end
+end
+
+-- A setting in the event updates the light's cached settings, and is published. Only settings the
+-- light was found to have are taken (the proxy reports every setting for any light); a light not
+-- read yet is left for its next read.
+function HandleDataToUI(raw)
+    local id = tonumber(string.match(raw, '<param name="iddevice"[^>]*>(%d+)</param>'))
+    local data = string.match(raw, '<param name="data"[^>]*>(.-)</param>')
+    local deviceID = id and gDataToUIIds[id]
+    if not (deviceID and data) then
+        return
+    end
+    local proxyID = tonumber(GetProxyID(deviceID))
+    if not IsLightV2(proxyID) then
+        HandleV1DataToUI(deviceID, id, data)
+        return
+    end
+    local settings = gLightV2Settings[proxyID]
+    if not settings then
+        return
+    end
+    local fromDevice = (id ~= proxyID)
+    local changed = false
+    for tag, value in string.gmatch(data, "<([%w_]+)>([^<]*)</%1>") do
+        for suffix, control in pairs(DIMMER_CONTROL_VARS) do
+            local controlTag = control.tag
+            if fromDevice then
+                controlTag = control.device_tag
+            elseif control.device_tag then
+                controlTag = nil
+            end
+            if controlTag == tag and settings.values[suffix] ~= nil and settings.values[suffix] ~= value then
+                settings.values[suffix] = value
+                changed = true
+            end
+        end
+        if fromDevice then
+            for suffix, flag in pairs(DEVICE_FLAG_SETTINGS) do
+                if flag.tag == tag and settings.flags and settings.flags[suffix] ~= nil then
+                    local on = (value == "True" or value == "true" or value == "1")
+                    if settings.flags[suffix] ~= on then
+                        settings.flags[suffix] = on
+                        changed = true
+                    end
+                end
+            end
+        end
+    end
+    if changed and gMQTTConnected and IsAdvancedDimmerControlEnabled() then
+        Log("Light " .. deviceID .. " setting changed in Control4: " .. string.sub(data, 1, 100))
+        RunWithCachedSettings(function()
+            RunSkippingUnchanged(function() PublishDimmerAdvancedControlStates(deviceID) end)
+        end)
+    end
+end
+
+-- V1 dimmers: their hold rates have no variable, but the dimmer's device reports them in
+-- OnDataToUI (lowercase, in ms: <hold_ramp_rate_up>3000</hold_ramp_rate_up>). Its other settings
+-- are proxy variables, already watched. On a change the V1 driver sends its whole state several
+-- times over, with old and new values interleaved (confirmed on a V1 dimmer, 2026-11-19), so the
+-- last value is published 1 s after the last report.
+V1_HOLD_RATE_SETTLE = 1000
+gV1HoldRateTimers = {}
+
+function HandleV1DataToUI(deviceID, id, data)
+    if id ~= deviceID then
+        return
+    end
+    local reported = false
+    for tag, value in string.gmatch(data, "<([%w_]+)>([^<]*)</%1>") do
+        local ms = tonumber(value)
+        local key = (tag == "hold_ramp_rate_up" and "up") or (tag == "hold_ramp_rate_down" and "down")
+        if key and ms then
+            gHoldRampRates[deviceID] = gHoldRampRates[deviceID] or {}
+            gHoldRampRates[deviceID][key] = ms / 1000
+            reported = true
+        end
+    end
+    if not reported then
+        return
+    end
+    CancelTimerObject(gV1HoldRateTimers[deviceID])
+    gV1HoldRateTimers[deviceID] = SafeSetTimer(V1_HOLD_RATE_SETTLE, function()
+        gV1HoldRateTimers[deviceID] = nil
+        if gMQTTConnected and IsAdvancedDimmerControlEnabled() then
+            RunSkippingUnchanged(function() PublishDimmerAdvancedControlStates(deviceID) end)
+        end
+    end)
 end
 
 -- One check 3 s after the last of a burst of events (deleting several devices raises several)
@@ -6127,9 +6502,11 @@ function PublishAllStates()
         if IsAdvancedDimmerControlEnabled() then
             PublishDimmerAdvancedControlStates(lightID)
         end
+        PublishEnergyStates(lightID)
     end
     for _, switchID in ipairs(gMonitoredSwitches) do
         PublishSwitchState(switchID)
+        PublishEnergyStates(switchID)
         if IsLEDControlEnabled() then
             PublishAllLEDStates(switchID)
         end
